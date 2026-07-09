@@ -531,6 +531,8 @@ function PartnersBlock({
   onAdd: () => void;
   onDeleted: (id: string) => void;
 }) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+
   // Para cada socio, calcular ingresos y egresos matcheando cuit_contraparte
   const rows = useMemo(() => partners.map(p => {
     const cuit = normCuit(p.cuit);
@@ -541,12 +543,20 @@ function PartnersBlock({
     });
     const ingresos = movs.filter(m => m.tipo === "ingreso").reduce((a, b) => a + Number(b.monto), 0);
     const egresos  = movs.filter(m => m.tipo === "egreso").reduce((a, b) => a + Number(b.monto), 0);
-    // saldo positivo: el socio le debe a la empresa (aportó menos de lo que retiró → la empresa le prestó)
     // Regla contable:
     //   egresos (plata que le dimos al socio) - ingresos (plata que el socio trajo) = saldo deudor del socio
     const saldo = egresos - ingresos;
     return { partner: p, movs, ingresos, egresos, saldo };
   }), [partners, movements]);
+
+  // Totales consolidados de todos los socios
+  const totales = useMemo(() => {
+    const aportes = rows.reduce((a, r) => a + r.ingresos, 0);
+    const retiros = rows.reduce((a, r) => a + r.egresos, 0);
+    const saldoNeto = retiros - aportes;
+    const movs = rows.reduce((a, r) => a + r.movs.length, 0);
+    return { aportes, retiros, saldoNeto, movs };
+  }, [rows]);
 
   async function deletePartner(id: string, nombre: string) {
     if (!confirm(`¿Eliminar al socio "${nombre}"? Los movimientos bancarios no se tocan.`)) return;
@@ -561,9 +571,9 @@ function PartnersBlock({
     <div className="card overflow-hidden">
       <div className="px-5 py-4 border-b border-line flex items-center justify-between">
         <div>
-          <div className="sf-display text-[15px] font-semibold">Retiros e ingresos de socios</div>
+          <div className="sf-display text-[15px] font-semibold">Cuenta corriente de socios</div>
           <div className="text-[12px] text-ink-3">
-            Movimientos hacia/desde socios identificados. Saldo positivo: el socio debe a la empresa. Negativo: la empresa le debe al socio.
+            Aportes (ingresos hacia la empresa) y retiros (egresos hacia el socio) detectados por CUIT/DNI.
           </div>
         </div>
         <button className="btn btn-primary" onClick={onAdd}>
@@ -585,61 +595,241 @@ function PartnersBlock({
           </button>
         </div>
       ) : (
-        <table className="clean">
-          <thead>
-            <tr>
-              <th>Socio</th>
-              <th>Relación</th>
-              <th>CUIT / DNI</th>
-              <th className="text-right">Ingresos (aportes)</th>
-              <th className="text-right">Egresos (retiros)</th>
-              <th className="text-right">Saldo</th>
-              <th className="text-right">Movimientos</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
+        <>
+          {/* Resumen consolidado — 3 KPIs grandes */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 p-5" style={{ background: "#fafafa" }}>
+            <SummaryCard
+              label="Aportes de socios"
+              subtitle={`${rows.filter(r => r.ingresos > 0).length} socios aportaron`}
+              amount={totales.aportes}
+              tone="ingreso"
+              iconArrow="down"
+              hint="Ingresó a la empresa"
+            />
+            <SummaryCard
+              label="Retiros a socios"
+              subtitle={`${rows.filter(r => r.egresos > 0).length} socios recibieron`}
+              amount={totales.retiros}
+              tone="egreso"
+              iconArrow="up"
+              hint="Salió de la empresa"
+            />
+            <SummaryCard
+              label={totales.saldoNeto > 0 ? "Deuda neta de socios" : totales.saldoNeto < 0 ? "Deuda neta a socios" : "Saldo neto"}
+              subtitle={
+                totales.saldoNeto > 0
+                  ? "Los socios retiraron más de lo que aportaron"
+                  : totales.saldoNeto < 0
+                    ? "Los socios aportaron más de lo que retiraron"
+                    : "Aportes = Retiros"
+              }
+              amount={Math.abs(totales.saldoNeto)}
+              tone={totales.saldoNeto === 0 ? "neutral" : totales.saldoNeto > 0 ? "ingreso" : "egreso"}
+              iconArrow={totales.saldoNeto === 0 ? "eq" : totales.saldoNeto > 0 ? "up" : "down"}
+              hint={`${totales.movs} movimientos totales`}
+            />
+          </div>
+
+          {/* Tarjetas por socio */}
+          <div className="p-5 space-y-3 border-t border-line">
             {rows.map(r => {
               const p = r.partner;
               const saldo = r.saldo;
-              const label = saldo > 0
-                ? `Deuda del socio`
-                : saldo < 0
-                  ? `Crédito del socio`
-                  : "En cero";
+              const isDeudor = saldo > 0;
+              const isAcreedor = saldo < 0;
+              const total = r.ingresos + r.egresos;
+              const pctIng = total > 0 ? (r.ingresos / total) * 100 : 0;
+              const pctEgr = total > 0 ? (r.egresos / total) * 100 : 0;
+              const isOpen = expanded === p.id;
+
               return (
-                <tr key={p.id}>
-                  <td className="font-medium">{p.nombre}</td>
-                  <td className="text-ink-2 capitalize">{p.relacion}</td>
-                  <td className="text-ink-2 font-mono text-[12px]">
-                    {p.cuit ? formatCuitDisplay(p.cuit) : ""}
-                    {p.cuit && p.dni ? " · " : ""}
-                    {p.dni ? `DNI ${p.dni}` : ""}
-                    {!p.cuit && !p.dni ? "—" : ""}
-                  </td>
-                  <td className="text-right" style={{ color: "#30a46c" }}>+ {money(r.ingresos)}</td>
-                  <td className="text-right">− {money(r.egresos)}</td>
-                  <td className="text-right">
-                    <div className="flex flex-col items-end">
-                      <span className="font-semibold" style={{ color: saldo === 0 ? "#6e6e73" : saldo > 0 ? "#30a46c" : "#f04f6f" }}>
-                        {money(Math.abs(saldo))}
-                      </span>
-                      <span className="text-[10px] text-ink-3">{label}</span>
+                <div key={p.id} className="card" style={{ padding: 0, overflow: "hidden" }}>
+                  <div className="p-4">
+                    <div className="flex items-start justify-between gap-4 flex-wrap">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-full flex items-center justify-center"
+                             style={{ background: "var(--accent-soft)", color: "var(--accent)", fontWeight: 600 }}>
+                          {p.nombre.slice(0, 2).toUpperCase()}
+                        </div>
+                        <div>
+                          <div className="sf-display font-semibold text-[15px]">{p.nombre}</div>
+                          <div className="text-[11px] text-ink-3 capitalize">
+                            {p.relacion}
+                            {p.porcentaje ? ` · ${p.porcentaje}%` : ""}
+                            {p.cuit ? ` · CUIT ${formatCuitDisplay(p.cuit)}` : ""}
+                            {!p.cuit && p.dni ? ` · DNI ${p.dni}` : ""}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          className="btn btn-ghost"
+                          style={{ padding: "6px 12px", fontSize: 12 }}
+                          onClick={() => setExpanded(isOpen ? null : p.id)}
+                        >
+                          {isOpen ? "Ocultar" : `Ver ${r.movs.length} movimientos`}
+                        </button>
+                        <button className="btn btn-ghost" style={{padding:"6px 10px", color: "#f04f6f"}}
+                                onClick={() => deletePartner(p.id, p.nombre)}>
+                          <Icon.Close/>
+                        </button>
+                      </div>
                     </div>
-                  </td>
-                  <td className="text-right text-ink-2">{r.movs.length}</td>
-                  <td className="text-right">
-                    <button className="btn btn-ghost" style={{padding:"6px 10px", color: "#f04f6f"}}
-                            onClick={() => deletePartner(p.id, p.nombre)}>
-                      <Icon.Close/>
-                    </button>
-                  </td>
-                </tr>
+
+                    {/* Grid de números: Aportes | Retiros | Saldo */}
+                    <div className="grid grid-cols-3 gap-3 mt-4">
+                      <div className="rounded-xl p-3" style={{ background: "#e6f6ed" }}>
+                        <div className="text-[11px] uppercase tracking-wider" style={{ color: "#30a46c" }}>
+                          Aportó
+                        </div>
+                        <div className="sf-display text-[20px] font-semibold mt-1" style={{ color: "#218358" }}>
+                          {money(r.ingresos)}
+                        </div>
+                        <div className="text-[10px] text-ink-3 mt-1">
+                          {r.movs.filter(m => m.tipo === "ingreso").length} ingresos
+                        </div>
+                      </div>
+                      <div className="rounded-xl p-3" style={{ background: "#fdeaef" }}>
+                        <div className="text-[11px] uppercase tracking-wider" style={{ color: "#f04f6f" }}>
+                          Retiró
+                        </div>
+                        <div className="sf-display text-[20px] font-semibold mt-1" style={{ color: "#c02648" }}>
+                          {money(r.egresos)}
+                        </div>
+                        <div className="text-[10px] text-ink-3 mt-1">
+                          {r.movs.filter(m => m.tipo === "egreso").length} egresos
+                        </div>
+                      </div>
+                      <div className="rounded-xl p-3" style={{
+                        background: saldo === 0 ? "#ececf0" : isDeudor ? "#fcf0dd" : "#efeaff"
+                      }}>
+                        <div className="text-[11px] uppercase tracking-wider"
+                             style={{ color: saldo === 0 ? "#6e6e73" : isDeudor ? "#b4730e" : "#7c5cff" }}>
+                          {saldo === 0 ? "En cero" : isDeudor ? "Debe a la empresa" : "Empresa le debe"}
+                        </div>
+                        <div className="sf-display text-[20px] font-semibold mt-1"
+                             style={{ color: saldo === 0 ? "#3d3d40" : isDeudor ? "#8a5709" : "#5a3fd6" }}>
+                          {money(Math.abs(saldo))}
+                        </div>
+                        <div className="text-[10px] text-ink-3 mt-1">
+                          {saldo === 0
+                            ? "Aportes = retiros"
+                            : isDeudor
+                              ? "Se retiró más de lo aportado"
+                              : "Se aportó más de lo retirado"}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Barra de proporción */}
+                    {total > 0 && (
+                      <div className="mt-3">
+                        <div className="w-full h-2 rounded-full overflow-hidden flex" style={{ background: "#ececf0" }}>
+                          <div style={{ width: `${pctIng}%`, background: "#30a46c" }} />
+                          <div style={{ width: `${pctEgr}%`, background: "#f04f6f" }} />
+                        </div>
+                        <div className="flex justify-between text-[10px] text-ink-3 mt-1">
+                          <span>Aportes {pctIng.toFixed(0)}%</span>
+                          <span>Retiros {pctEgr.toFixed(0)}%</span>
+                        </div>
+                      </div>
+                    )}
+
+                    {r.movs.length === 0 && (
+                      <div className="mt-3 text-[12px] text-ink-3 text-center py-3 rounded-xl" style={{ background: "#fafafa" }}>
+                        Sin movimientos bancarios detectados con este socio todavía.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Detalle expandible */}
+                  {isOpen && r.movs.length > 0 && (
+                    <div className="border-t border-line" style={{ background: "#fafafa" }}>
+                      <table className="clean">
+                        <thead>
+                          <tr>
+                            <th style={{ background: "#fafafa" }}>Fecha</th>
+                            <th style={{ background: "#fafafa" }}>Banco</th>
+                            <th style={{ background: "#fafafa" }}>Descripción</th>
+                            <th style={{ background: "#fafafa" }}>Tipo</th>
+                            <th style={{ background: "#fafafa" }} className="text-right">Importe</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {r.movs
+                            .slice()
+                            .sort((a, b) => b.fecha.localeCompare(a.fecha))
+                            .map(m => (
+                              <tr key={m.id}>
+                                <td className="text-ink-2">{m.fecha}</td>
+                                <td className="text-ink-2">{m.banco ?? "—"}</td>
+                                <td className="text-ink-2 truncate" style={{ maxWidth: 300 }}>
+                                  {m.descripcion}
+                                </td>
+                                <td>
+                                  <Badge tone={m.tipo === "ingreso" ? "ingreso" : "egreso"}>
+                                    {m.tipo === "ingreso" ? "Aporte" : "Retiro"}
+                                  </Badge>
+                                </td>
+                                <td className="text-right font-semibold"
+                                    style={{ color: m.tipo === "ingreso" ? "#30a46c" : "#f04f6f" }}>
+                                  {m.tipo === "ingreso" ? "+ " : "− "}{money(m.monto)}
+                                </td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
               );
             })}
-          </tbody>
-        </table>
+          </div>
+        </>
       )}
+    </div>
+  );
+}
+
+// ============================================================================
+// Tarjeta de KPI para el resumen consolidado de socios
+// ============================================================================
+
+function SummaryCard({
+  label, subtitle, amount, tone, iconArrow, hint
+}: {
+  label: string;
+  subtitle: string;
+  amount: number;
+  tone: "ingreso" | "egreso" | "neutral";
+  iconArrow: "up" | "down" | "eq";
+  hint?: string;
+}) {
+  const palette =
+    tone === "ingreso" ? { bg: "#e6f6ed", ico: "#30a46c", strong: "#218358" } :
+    tone === "egreso"  ? { bg: "#fdeaef", ico: "#f04f6f", strong: "#c02648" } :
+                         { bg: "#ececf0", ico: "#6e6e73", strong: "#3d3d40" };
+
+  const arrow = iconArrow === "up" ? "↑" : iconArrow === "down" ? "↓" : "=";
+
+  return (
+    <div className="rounded-2xl p-4" style={{ background: palette.bg }}>
+      <div className="flex items-start justify-between">
+        <div>
+          <div className="text-[11px] uppercase tracking-wider" style={{ color: palette.ico }}>
+            {label}
+          </div>
+          <div className="text-[11px] text-ink-3 mt-0.5">{subtitle}</div>
+        </div>
+        <div className="w-8 h-8 rounded-full flex items-center justify-center font-bold text-[14px]"
+             style={{ background: "#fff", color: palette.ico }}>
+          {arrow}
+        </div>
+      </div>
+      <div className="sf-display text-[26px] font-semibold mt-3" style={{ color: palette.strong }}>
+        {money(amount)}
+      </div>
+      {hint && <div className="text-[11px] text-ink-3 mt-1">{hint}</div>}
     </div>
   );
 }
