@@ -73,22 +73,55 @@ export async function POST(req: NextRequest) {
   // Armamos el batch
   const rows: any[] = [];
   const skipped: any[] = [];
+  const monedaWarnings: string[] = [];
+
+  // El tipo_listado que devuelve la IA es la fuente de verdad principal:
+  //   "emitidos" (Mis Comprobantes Emitidos) → TODAS son ventas nuestras
+  //   "recibidos" (Mis Comprobantes Recibidos) → TODAS son compras que nos hicieron
+  // Solo caemos al match de CUIT si el tipo_listado no está claro.
+  const tipoListado = String(data.tipo_listado ?? "").toLowerCase();
+
   for (const f of data.facturas) {
     const cuitEmisor = onlyDigits(f.cuit_emisor);
-    // Si el CUIT emisor == empresa → es venta (nosotros emitimos). Sino → compra (nos emitieron).
-    const tipo: "venta" | "compra" = (cuitEmisor && cuitEmpresa && cuitEmisor === cuitEmpresa) ? "venta" : "compra";
-    // Para compras (recibidas), contraparte = emisor. Para ventas, contraparte = receptor (aca no lo tenemos).
+    let tipo: "venta" | "compra";
+    if (tipoListado === "emitidos") {
+      tipo = "venta";
+    } else if (tipoListado === "recibidos") {
+      tipo = "compra";
+    } else {
+      // Fallback: comparar CUITs si no está claro qué tipo de listado es
+      tipo = (cuitEmisor && cuitEmpresa && cuitEmisor === cuitEmpresa) ? "venta" : "compra";
+    }
     const razon_social = f.razon_social_emisor;
     const cuit = formatCuit(cuitEmisor);
 
-    const key = existKey(f.comprobante, f.fecha_emision, cuitEmisor, Number(f.total ?? 0));
+    // Moneda y tipo de cambio
+    const moneda = (f.moneda === "USD" || f.moneda === "EUR" || f.moneda === "OTRA") ? f.moneda : "ARS";
+    const tcRaw = Number(f.tipo_cambio ?? 0);
+    const tipo_cambio = moneda === "ARS" ? 1 : (tcRaw > 0 ? tcRaw : 1);
+
+    // Importes originales
+    const netoOrig  = Number(f.neto_gravado) || 0;
+    const ivaOrig   = Number(f.iva_total) || 0;
+    const otrosOrig = Number(f.otros_tributos) || 0;
+    const totalOrig = Number(f.total) || 0;
+
+    // Importes convertidos a ARS
+    const neto  = Math.round(netoOrig  * tipo_cambio * 100) / 100;
+    const iva   = Math.round(ivaOrig   * tipo_cambio * 100) / 100;
+    const otros = Math.round(otrosOrig * tipo_cambio * 100) / 100;
+    const total = Math.round(totalOrig * tipo_cambio * 100) / 100;
+
+    if (moneda !== "ARS" && tcRaw <= 0) {
+      monedaWarnings.push(`Factura ${f.comprobante ?? "sin ID"} en ${moneda} sin TC — se guardó tratando el importe como ARS. Editá manualmente el TC.`);
+    }
+
+    const key = existKey(f.comprobante, f.fecha_emision, cuitEmisor, total);
     if (existSet.has(key)) { skipped.push({ comprobante: f.comprobante, razon_social, reason: "duplicado" }); continue; }
 
-    // Inferir alícuota IVA a partir del ratio iva_total / neto_gravado.
-    // Esto cubre el caso general (una sola alícuota por factura) que es el 95%+ de los casos.
     const ivaBuckets = inferIvaBuckets({
-      neto_gravado: Number(f.neto_gravado) || 0,
-      iva_total:    Number(f.iva_total) || 0,
+      neto_gravado: neto,
+      iva_total:    iva,
       letra:        f.letra,
       codigo_afip:  f.codigo_tipo_afip
     });
@@ -102,15 +135,20 @@ export async function POST(req: NextRequest) {
       comprobante: f.comprobante ?? null,
       punto_venta: f.punto_venta ?? null,
       numero: f.numero ?? null,
-      neto_gravado: f.neto_gravado ?? 0,
+      neto_gravado: neto,
       iva_21:   ivaBuckets.iva_21,
       iva_10_5: ivaBuckets.iva_10_5,
       iva_27:   ivaBuckets.iva_27,
       iva_otros: ivaBuckets.iva_otros,
-      percepciones: f.otros_tributos ?? 0,
-      total: f.total ?? 0,
+      percepciones: otros,
+      total,
       cae: f.cae ?? null,
       storage_path: storagePath,
+      moneda,
+      tipo_cambio,
+      total_moneda_original: moneda !== "ARS" ? totalOrig : null,
+      neto_moneda_original: moneda !== "ARS" ? netoOrig : null,
+      iva_total_moneda_original: moneda !== "ARS" ? ivaOrig : null,
       ai_metadata: {
         from_arca_list: true,
         tipo_afip: f.codigo_tipo_afip,
@@ -121,10 +159,11 @@ export async function POST(req: NextRequest) {
         otros_tributos: f.otros_tributos,
         list_confidence: data.confidence ?? null,
         alicuota_inferida: ivaBuckets.alicuota_inferida,
-        inferencia_ok: ivaBuckets.match
+        inferencia_ok: ivaBuckets.match,
+        moneda_original: moneda,
+        tipo_cambio_aplicado: tipo_cambio
       } as any,
       ai_confidence: data.confidence ?? null,
-      // Aprobada si la inferencia de alícuota calzó; revisión si no (casos mixtos o letra C).
       status: ivaBuckets.match ? "aprobada" : "revision",
       created_by: user.id
     });
@@ -146,7 +185,7 @@ export async function POST(req: NextRequest) {
     ok: true,
     inserted: inserted?.length ?? 0,
     skipped,
-    warnings: data.warnings ?? [],
+    warnings: [...(data.warnings ?? []), ...monedaWarnings],
     cuit_titular: data.cuit_titular,
     tipo_listado: data.tipo_listado
   });

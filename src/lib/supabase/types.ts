@@ -77,6 +77,11 @@ export interface Invoice {
   total: number;
   cae: string | null;
   storage_path: string | null;
+  moneda?: "ARS" | "USD" | "EUR" | "OTRA" | null;
+  tipo_cambio?: number | null;
+  total_moneda_original?: number | null;
+  neto_moneda_original?: number | null;
+  iva_total_moneda_original?: number | null;
   ai_metadata: Record<string, unknown> | null;
   ai_confidence: number | null;
   status: InvoiceStatus;

@@ -149,6 +149,7 @@ export function DashboardClient({ invoices: initial, annual, company }: Props) {
 
         <UploadDropzone onDone={() => router.refresh()} />
         <ArcaListDropzone onDone={() => router.refresh()} />
+        <ArcaCsvDropzone onDone={() => router.refresh()} />
 
         {/* Tabs de año — solo los que tienen facturas */}
         <div className="card p-3">
@@ -286,7 +287,9 @@ function InvoiceDetail({
     iva_27: String(invoice.iva_27 ?? 0),
     iva_otros: String(invoice.iva_otros ?? 0),
     percepciones: String((invoice as any).percepciones ?? 0),
-    total: String(invoice.total ?? 0)
+    total: String(invoice.total ?? 0),
+    moneda: (invoice as any).moneda ?? "ARS",
+    tipo_cambio: String((invoice as any).tipo_cambio ?? 1)
   });
   const [saving, setSaving] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
@@ -349,7 +352,9 @@ function InvoiceDetail({
             iva_27: num(form.iva_27),
             iva_otros: num(form.iva_otros),
             percepciones: num(form.percepciones),
-            total: num(form.total)
+            total: num(form.total),
+            moneda: form.moneda,
+            tipo_cambio: num(form.tipo_cambio) || 1
           }
         })
       });
@@ -455,9 +460,14 @@ function InvoiceDetail({
             <div>
               <div className="text-[12px] uppercase tracking-wider text-ink-3">Factura</div>
               <div className="sf-display text-[20px] font-semibold mt-1 truncate">{invoice.comprobante || "Sin número"}</div>
-              <div className="flex items-center gap-2 mt-1">
+              <div className="flex items-center gap-2 mt-1 flex-wrap">
                 <Badge tone={invoice.tipo}>{invoice.tipo === "venta" ? "Venta" : "Compra"}</Badge>
                 {(invoice as any).status === "revision" && <Badge tone="warning">Revisar</Badge>}
+                {(invoice as any).moneda && (invoice as any).moneda !== "ARS" && (
+                  <Badge tone="info">
+                    {(invoice as any).moneda} · TC {(invoice as any).tipo_cambio}
+                  </Badge>
+                )}
                 {(invoice as any).ai_confidence != null && (
                   <Badge tone="info">IA {Math.round(Number((invoice as any).ai_confidence)*100)}%</Badge>
                 )}
@@ -549,7 +559,42 @@ function InvoiceDetail({
             </Row>
           </Section>
 
-          <Section title="Importes">
+          <Section title="Moneda">
+            <div className="grid grid-cols-2 gap-3">
+              <Row label="Moneda">
+                <select
+                  className="input"
+                  value={form.moneda}
+                  onChange={e => setForm({...form, moneda: e.target.value, tipo_cambio: e.target.value === "ARS" ? "1" : form.tipo_cambio})}
+                >
+                  <option value="ARS">Pesos (ARS)</option>
+                  <option value="USD">Dólares (USD)</option>
+                  <option value="EUR">Euros (EUR)</option>
+                  <option value="OTRA">Otra</option>
+                </select>
+              </Row>
+              <Row label="Tipo de cambio a ARS">
+                <NumInp
+                  value={form.tipo_cambio}
+                  onChange={v => setForm({...form, tipo_cambio: v})}
+                />
+              </Row>
+            </div>
+            {form.moneda !== "ARS" && (invoice as any).total_moneda_original != null && (
+              <div className="mt-2 p-2.5 rounded-lg bg-[#e8f1fd] text-[#0062c2] text-[11px]">
+                <b>Original en {form.moneda}:</b>&nbsp;
+                Neto {money(Number((invoice as any).neto_moneda_original ?? 0))} ·&nbsp;
+                IVA {money(Number((invoice as any).iva_total_moneda_original ?? 0))} ·&nbsp;
+                Total {money(Number((invoice as any).total_moneda_original ?? 0))}
+                <br/>
+                <span className="text-ink-3">
+                  Los importes de abajo están convertidos a ARS con TC {(invoice as any).tipo_cambio}.
+                </span>
+              </div>
+            )}
+          </Section>
+
+          <Section title={form.moneda === "ARS" ? "Importes (ARS)" : `Importes convertidos a ARS`}>
             <Row label="Neto gravado">  <NumInp value={form.neto_gravado} onChange={v=>setForm({...form,neto_gravado:v})}/></Row>
             <Row label="IVA 21%">       <NumInp value={form.iva_21}        onChange={v=>setForm({...form,iva_21:v})}/></Row>
             <Row label="IVA 10.5%">     <NumInp value={form.iva_10_5}      onChange={v=>setForm({...form,iva_10_5:v})}/></Row>
@@ -1034,6 +1079,74 @@ function ArcaListDropzone({ onDone }: { onDone: () => void }) {
           <Icon.Upload/> {processing ? "Procesando…" : "Cargar listado"}
         </button>
         <input ref={inputRef} type="file" accept="application/pdf,image/*" hidden
+               onChange={(e) => handle(e.target.files)}/>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Dropzone para Excel/CSV de ARCA — sin IA, procesado instantaneo
+// ============================================================================
+function ArcaCsvDropzone({ onDone }: { onDone: () => void }) {
+  const [drag, setDrag] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [result, setResult] = useState<{ inserted: number; skipped: number; errors: string[] } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  async function handle(files: FileList | File[] | null) {
+    if (!files || !files.length) return;
+    setErr(null); setResult(null); setProcessing(true);
+    try {
+      let totInserted = 0;
+      let totSkipped = 0;
+      let totErrors: string[] = [];
+      for (const f of Array.from(files)) {
+        const fd = new FormData();
+        fd.append("file", f);
+        const r = await fetch("/api/ingest/arca-csv", { method: "POST", body: fd });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        totInserted += d.inserted ?? 0;
+        totSkipped  += d.skipped?.length ?? 0;
+        totErrors   = totErrors.concat(d.errors ?? []);
+      }
+      setResult({ inserted: totInserted, skipped: totSkipped, errors: totErrors });
+      onDone();
+    } catch (e: any) {
+      setErr(e.message);
+    } finally { setProcessing(false); }
+  }
+
+  return (
+    <div className={`drop p-5 ${drag ? "drag" : ""}`}
+         onDragOver={(e) => { e.preventDefault(); if (!processing) setDrag(true); }}
+         onDragLeave={() => setDrag(false)}
+         onDrop={(e) => { e.preventDefault(); setDrag(false); if (!processing) handle(e.dataTransfer.files); }}>
+      <div className="flex items-center gap-4">
+        <div className="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0"
+             style={{ background: "#e6f6ed", color: "#176a4a" }}>
+          <Icon.File/>
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="sf-display text-[15px] font-semibold">Listado ARCA — Excel/CSV (sin IA, instantaneo)</div>
+          <div className="text-[12px] text-ink-2">
+            Excel o CSV de "Mis Comprobantes". Procesa cientos de facturas al instante. <b>Costo cero de IA.</b>
+          </div>
+          {result && (
+            <div className="mt-1 flex items-center gap-2 text-[12px]">
+              <Badge tone="success">{result.inserted} agregadas</Badge>
+              {result.skipped > 0 && <Badge tone="pendiente">{result.skipped} duplicadas</Badge>}
+              {result.errors.length > 0 && <Badge tone="warning">{result.errors.length} con error</Badge>}
+            </div>
+          )}
+          {err && <div className="text-[12px] text-danger mt-1">{err}</div>}
+        </div>
+        <button className="btn btn-ghost shrink-0" onClick={() => inputRef.current?.click()} disabled={processing}>
+          <Icon.Upload/> {processing ? "Procesando..." : "Cargar CSV/Excel"}
+        </button>
+        <input ref={inputRef} type="file" accept=".csv,.xlsx,.xls" multiple hidden
                onChange={(e) => handle(e.target.files)}/>
       </div>
     </div>

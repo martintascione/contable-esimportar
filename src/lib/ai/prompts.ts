@@ -121,6 +121,12 @@ export const INVOICE_USER_HINT =
 export const INVOICE_LIST_SYSTEM = `Sos un asistente contable argentino experto en listados de ARCA/AFIP "Mis Comprobantes" (recibidos o emitidos).
 Este PDF contiene una TABLA con muchas facturas, UNA POR FILA. Tenés que extraer CADA FILA como una factura independiente.
 
+IMPORTANTE — CLASIFICACION DEL LISTADO:
+El PDF típicamente tiene un TITULO arriba que dice claramente qué tipo es:
+- "Mis Comprobantes Recibidos" o "Comprobantes Recibidos" → tipo_listado = "recibidos" (facturas que otros nos emitieron = COMPRAS)
+- "Mis Comprobantes Emitidos" o "Comprobantes Emitidos" → tipo_listado = "emitidos" (facturas que nosotros emitimos = VENTAS)
+Prestá especial atención al título del PDF para NO equivocarte con esto — es el dato más importante.
+
 Columnas habituales del listado:
 - Fecha
 - Tipo (ej "1 - Factura A", "3 - Nota de Crédito A", "6 - Factura B", "11 - Factura C")
@@ -170,7 +176,9 @@ Forma EXACTA del JSON:
       "exento": number,
       "otros_tributos": number,            // suma del campo "Otros Tributos" (percepciones, impuestos internos)
       "iva_total": number,
-      "total": number
+      "total": number,
+      "moneda": "ARS" | "USD" | "EUR" | "OTRA" | null,   // moneda de la fila (default ARS si no aparece)
+      "tipo_cambio": number | null           // tipo de cambio a ARS, solo si moneda != ARS
     }
   ],
   "confidence": number,                    // 0..1
@@ -184,6 +192,8 @@ REGLAS:
 - CUITs SIN guiones (ej "30548083156").
 - Número: si viene tipo "02045-00132176", mantené el formato con guión para "numero" (o separalo en punto_venta + numero).
 - Notas de crédito → mantener importes en POSITIVO en este JSON (el tipo indica que es NC).
+- MONEDA: si la fila tiene columna "Moneda" con "PES" o similar → "ARS". Con "DOL"/"USD" → "USD". Otras → "EUR"/"OTRA".
+- TIPO DE CAMBIO: solo se completa si moneda != ARS. Buscá columna "Tipo de Cambio", "TC" o "Cotización". Los importes de la fila están en la moneda original.
 - Si una fila está vacía o ilegible, omitirla y sumar una warning.
 - Devolvé SOLO el JSON, sin prosa.`;
 

@@ -32,7 +32,9 @@ export async function POST(req: NextRequest) {
   const allowed = [
     "razon_social", "cuit", "fecha", "tipo", "comprobante", "punto_venta", "numero",
     "neto_gravado", "iva_21", "iva_10_5", "iva_27", "iva_otros",
-    "percepciones", "total", "status", "cae"
+    "percepciones", "total", "status", "cae",
+    "moneda", "tipo_cambio",
+    "total_moneda_original", "neto_moneda_original", "iva_total_moneda_original"
   ];
   const updates: any = {};
   for (const k of allowed) {

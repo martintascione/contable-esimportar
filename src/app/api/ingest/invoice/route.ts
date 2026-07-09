@@ -60,16 +60,35 @@ export async function POST(req: NextRequest) {
       comprobante: data.comprobante ?? (data.punto_venta && data.numero ? `${data.tipo_comprobante} ${data.punto_venta}-${data.numero}` : null),
       punto_venta: data.punto_venta,
       numero: data.numero,
-      neto_gravado: data.neto_gravado ?? 0,
-      iva_21: data.iva_21 ?? 0,
-      iva_10_5: data.iva_10_5 ?? 0,
-      iva_27: data.iva_27 ?? 0,
-      iva_otros: (data.iva_otros ?? 0) + (data.iva_5 ?? 0) + (data.iva_2_5 ?? 0),
-      percepciones:
-        (data.percepciones_total ?? data.percepciones ?? 0) +
-        (data.impuestos_internos_total ?? 0) +
-        (data.otros_impuestos_total ?? 0),
-      total: data.total ?? 0,
+      ...(function() {
+        // Moneda y TC
+        const moneda = (data.moneda === "USD" || data.moneda === "EUR" || data.moneda === "OTRA") ? data.moneda : "ARS";
+        const tcRaw = Number(data.tipo_cambio ?? 0);
+        const tipo_cambio = moneda === "ARS" ? 1 : (tcRaw > 0 ? tcRaw : 1);
+        const netoOrig  = Number(data.neto_gravado ?? 0);
+        const ivaOtrosOrig = Number(data.iva_otros ?? 0) + Number(data.iva_5 ?? 0) + Number(data.iva_2_5 ?? 0);
+        const iva21Orig = Number(data.iva_21 ?? 0);
+        const iva105Orig = Number(data.iva_10_5 ?? 0);
+        const iva27Orig = Number(data.iva_27 ?? 0);
+        const percOrig = Number(data.percepciones_total ?? data.percepciones ?? 0) + Number(data.impuestos_internos_total ?? 0) + Number(data.otros_impuestos_total ?? 0);
+        const totalOrig = Number(data.total ?? 0);
+        const ivaTotalOrig = iva21Orig + iva105Orig + iva27Orig + ivaOtrosOrig;
+        const conv = (n: number) => Math.round(n * tipo_cambio * 100) / 100;
+        return {
+          neto_gravado: conv(netoOrig),
+          iva_21: conv(iva21Orig),
+          iva_10_5: conv(iva105Orig),
+          iva_27: conv(iva27Orig),
+          iva_otros: conv(ivaOtrosOrig),
+          percepciones: conv(percOrig),
+          total: conv(totalOrig),
+          moneda,
+          tipo_cambio,
+          total_moneda_original: moneda !== "ARS" ? totalOrig : null,
+          neto_moneda_original: moneda !== "ARS" ? netoOrig : null,
+          iva_total_moneda_original: moneda !== "ARS" ? ivaTotalOrig : null
+        };
+      })(),
       cae: data.cae,
       storage_path: storagePath,
       ai_metadata: data as any,

@@ -28,17 +28,30 @@ const INTEGRATION_PROVIDERS = [
   { key: "gdrive",      name: "Google Drive",         desc: "Backup automático de comprobantes" }
 ];
 
+type PartnerRow = {
+  id: string;
+  nombre: string;
+  cuit: string | null;
+  dni: string | null;
+  relacion: string;
+  porcentaje: number | null;
+  observaciones: string | null;
+};
+
 export function SettingsClient({
-  profile, company, teamMembers, integrations
+  profile, company, teamMembers, integrations, partners = []
 }: {
   profile: Profile & { companies: Company | null };
   company: Company | null;
   teamMembers: Pick<Profile, "id"|"email"|"full_name"|"role">[];
   integrations: Integration[];
+  partners?: PartnerRow[];
 }) {
   const canEdit = profile?.role === "admin";
   const [empresa, setEmpresa] = useState<Company | null>(company);
   const [members, setMembers] = useState(teamMembers);
+  const [partnerList, setPartnerList] = useState<PartnerRow[]>(partners);
+  const [addingPartner, setAddingPartner] = useState(false);
   const [intState, setIntState] = useState<Record<string, Integration | undefined>>(
     Object.fromEntries(integrations.map(i => [i.provider, i]))
   );
@@ -203,6 +216,14 @@ export function SettingsClient({
             </div>
           </div>
 
+          {canEdit && (
+            <PartnersCard
+              partners={partnerList}
+              onAdded={(p) => setPartnerList(prev => [...prev, p])}
+              onDeleted={(id) => setPartnerList(prev => prev.filter(x => x.id !== id))}
+              onOpenAdd={() => setAddingPartner(true)}
+            />
+          )}
           {canEdit && <PublicFichaCard empresa={empresa} onChange={setEmpresa}/>}
 
           <div className="card p-6">
@@ -268,6 +289,13 @@ export function SettingsClient({
           )}
         </div>
       </div>
+
+      {addingPartner && (
+        <AddPartnerSettingsModal
+          onClose={() => setAddingPartner(false)}
+          onCreated={(p) => { setPartnerList(prev => [...prev, p]); setAddingPartner(false); }}
+        />
+      )}
     </>
   );
 }
@@ -640,5 +668,192 @@ function HealthTile({
         ))}
       </div>
     </div>
+  );
+}
+
+// ============================================================================
+// Card de gestion de Socios
+// ============================================================================
+function PartnersCard({
+  partners, onAdded, onDeleted, onOpenAdd
+}: {
+  partners: PartnerRow[];
+  onAdded: (p: PartnerRow) => void;
+  onDeleted: (id: string) => void;
+  onOpenAdd: () => void;
+}) {
+  async function deletePartner(id: string, nombre: string) {
+    if (!confirm(`Eliminar al socio "${nombre}"? Los movimientos bancarios no se tocan.`)) return;
+    const r = await fetch("/api/partners/delete", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id })
+    });
+    if (r.ok) onDeleted(id);
+  }
+
+  return (
+    <div className="card p-6">
+      <div className="flex items-center justify-between mb-3 gap-3">
+        <div>
+          <div className="sf-display text-[17px] font-semibold flex items-center gap-2">
+            Socios y administradores
+            <Badge tone={partners.length > 0 ? "success" : "pendiente"}>
+              {partners.length} {partners.length === 1 ? "socio" : "socios"}
+            </Badge>
+          </div>
+          <div className="text-[12px] text-ink-3">
+            Cargá los CUITs y DNIs de los socios para identificar automaticamente sus movimientos bancarios (aportes / retiros de capital).
+          </div>
+        </div>
+        <button className="btn btn-primary shrink-0" onClick={onOpenAdd}>
+          <Icon.Plus/> Nuevo socio
+        </button>
+      </div>
+
+      {partners.length === 0 ? (
+        <div className="p-6 text-center text-[13px] text-ink-3 border border-dashed border-line rounded-xl">
+          Todavia no cargaste socios. Al agregar el CUIT y DNI de cada socio,
+          el sistema detecta automaticamente las transferencias bancarias hacia / desde ellos
+          y calcula la cuenta particular (aportes vs retiros).
+        </div>
+      ) : (
+        <table className="clean">
+          <thead>
+            <tr>
+              <th>Nombre</th>
+              <th>Relacion</th>
+              <th>CUIT</th>
+              <th>DNI</th>
+              <th className="text-right">Participacion</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {partners.map(p => (
+              <tr key={p.id}>
+                <td className="font-medium">{p.nombre}</td>
+                <td className="text-ink-2 capitalize">{p.relacion}</td>
+                <td className="text-ink-2 font-mono text-[12px]">{p.cuit ? formatCuitDisplay(p.cuit) : "—"}</td>
+                <td className="text-ink-2 font-mono text-[12px]">{p.dni ?? "—"}</td>
+                <td className="text-right text-ink-2">{p.porcentaje ? `${p.porcentaje}%` : "—"}</td>
+                <td className="text-right">
+                  <button className="btn btn-ghost" style={{padding:"6px 10px", color: "#f04f6f"}}
+                          onClick={() => deletePartner(p.id, p.nombre)}>
+                    <Icon.Close/>
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function formatCuitDisplay(c?: string | null) {
+  if (!c) return "";
+  const d = c.replace(/\D/g, "");
+  if (d.length !== 11) return c;
+  return `${d.slice(0,2)}-${d.slice(2,10)}-${d.slice(10)}`;
+}
+
+// ============================================================================
+// Modal para agregar socio desde Settings
+// ============================================================================
+function AddPartnerSettingsModal({
+  onClose, onCreated
+}: { onClose: () => void; onCreated: (p: PartnerRow) => void }) {
+  const [nombre, setNombre] = useState("");
+  const [cuit, setCuit] = useState("");
+  const [dni, setDni] = useState("");
+  const [relacion, setRelacion] = useState("socio");
+  const [porcentaje, setPorcentaje] = useState("");
+  const [observaciones, setObservaciones] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function save() {
+    setErr(null);
+    if (!nombre.trim()) return setErr("El nombre es obligatorio.");
+    setSaving(true);
+    try {
+      const r = await fetch("/api/partners", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          nombre: nombre.trim(),
+          cuit: cuit.trim() || null,
+          dni: dni.trim() || null,
+          relacion,
+          porcentaje: porcentaje ? Number(porcentaje) : null,
+          observaciones: observaciones.trim() || null
+        })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      onCreated(d.partner);
+    } catch (e: any) { setErr(e.message); }
+    finally { setSaving(false); }
+  }
+
+  return (
+    <>
+      <div className="modal-back" onClick={onClose}/>
+      <div className="fixed right-6 top-6 bottom-6 w-[480px] card soft p-6 z-30 fade-in overflow-y-auto scroll-clean">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <div className="text-[12px] uppercase tracking-wider text-ink-3">Configuracion</div>
+            <div className="sf-display text-[20px] font-semibold mt-1">Agregar socio</div>
+            <div className="text-[12px] text-ink-3">Con el CUIT y DNI, detectamos sus movimientos bancarios automaticamente.</div>
+          </div>
+          <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}><Icon.Close/></button>
+        </div>
+
+        <div className="space-y-3">
+          <div>
+            <div className="text-[11px] font-medium text-ink-2 mb-1">Nombre completo *</div>
+            <input className="input" value={nombre} onChange={e => setNombre(e.target.value)} placeholder="Ej: Martin Tascione"/>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <div className="text-[11px] font-medium text-ink-2 mb-1">CUIT</div>
+              <input className="input" value={cuit} onChange={e => setCuit(e.target.value)} placeholder="20-44267590-3"/>
+            </div>
+            <div>
+              <div className="text-[11px] font-medium text-ink-2 mb-1">DNI</div>
+              <input className="input" value={dni} onChange={e => setDni(e.target.value)} placeholder="44267590"/>
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px] font-medium text-ink-2 mb-1">Relacion</div>
+            <select className="input" value={relacion} onChange={e => setRelacion(e.target.value)}>
+              <option value="socio">Socio</option>
+              <option value="administrador">Administrador</option>
+              <option value="director">Director</option>
+              <option value="apoderado">Apoderado</option>
+              <option value="accionista">Accionista</option>
+            </select>
+          </div>
+          <div>
+            <div className="text-[11px] font-medium text-ink-2 mb-1">% Participacion (opcional)</div>
+            <input className="input" value={porcentaje} onChange={e => setPorcentaje(e.target.value)} placeholder="Ej: 50"/>
+          </div>
+          <div>
+            <div className="text-[11px] font-medium text-ink-2 mb-1">Observaciones</div>
+            <textarea className="input" rows={2} value={observaciones} onChange={e => setObservaciones(e.target.value)}/>
+          </div>
+
+          {err && <div className="p-2.5 rounded-lg bg-[#fdeaef] text-[#9c2944] text-[12px]">{err}</div>}
+
+          <div className="flex justify-end gap-2 mt-4">
+            <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
+            <button className="btn btn-primary" onClick={save} disabled={saving}>
+              <Icon.Check/> {saving ? "Guardando..." : "Guardar socio"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
   );
 }

@@ -44,16 +44,19 @@ export default async function SettingsPage() {
   let company: any = null;
   let teamMembers: any[] = [];
   let integrations: any[] = [];
+  let partners: any[] = [];
 
   if (companyId) {
-    const [c, m, it] = await Promise.all([
+    const [c, m, it, pt] = await Promise.all([
       admin.from("companies").select("*").eq("id", companyId).maybeSingle(),
       admin.from("profiles").select("id, email, full_name, role").eq("company_id", companyId),
-      admin.from("integrations").select("*").eq("company_id", companyId)
+      admin.from("integrations").select("*").eq("company_id", companyId),
+      admin.from("company_partners").select("*").eq("company_id", companyId).order("created_at", { ascending: true })
     ]);
     company = c.data;
     teamMembers = m.data ?? [];
     integrations = it.data ?? [];
+    partners = pt.data ?? [];
   }
 
   return (
@@ -62,6 +65,7 @@ export default async function SettingsPage() {
       company={company}
       teamMembers={teamMembers}
       integrations={integrations}
+      partners={partners}
     />
   );
 }

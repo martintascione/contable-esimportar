@@ -275,6 +275,8 @@ export interface InvoiceListRow {
   otros_tributos: number;
   iva_total: number;
   total: number;
+  moneda?: "ARS" | "USD" | "EUR" | "OTRA" | null;
+  tipo_cambio?: number | null;
 }
 
 export interface InvoiceListExtraction {
