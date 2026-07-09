@@ -108,3 +108,5 @@ contable-ia/
 - **Edge Functions** para el cierre mensual automático (cron semanal/mensual).
 - **WebHooks de AFIP** o scraping de Mis Comprobantes via n8n para descarga automática.
 - **Alertas por WhatsApp/Resend** cuando haya documentos próximos a vencer o cierre de IVA.
+
+Panel: https://contable.esimportar.com
