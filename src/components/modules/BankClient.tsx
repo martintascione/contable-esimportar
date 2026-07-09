@@ -17,6 +17,8 @@ type MovementEnriched = BankMovement & {
   nombre_contraparte?: string | null;
   es_transferencia?: boolean | null;
   es_cuenta_propia?: boolean | null;
+  socio_nombre?: string | null;
+  socio_relacion?: string | null;
 };
 type Statement = {
   id: string;
@@ -62,7 +64,7 @@ export function BankClient({ movements: initial, invoices, statements, partners:
   const [movements, setMovements] = useState<MovementEnriched[]>(initial);
   const [banco, setBanco] = useState<string>("__todos__");
   const [periodo, setPeriodo] = useState<string>("__todos__"); // "__todos__" | "YYYY-MM"
-  const [tipoParte, setTipoParte] = useState<"todos" | "propia" | "tercero" | "sin_cuit">("todos");
+  const [tipoParte, setTipoParte] = useState<"todos" | "propia" | "tercero" | "socios" | "sin_cuit">("todos");
   const [q, setQ] = useState("");
   const [modal, setModal] = useState<MovementEnriched | null>(null);
   const [reclassifying, setReclassifying] = useState(false);
@@ -114,12 +116,45 @@ export function BankClient({ movements: initial, invoices, statements, partners:
     return mesesDelBanco.some(m => m.ym === periodo) ? periodo : "__todos__";
   }, [periodo, mesesDelBanco]);
 
+  // Set de CUITs y DNIs de socios para detección rápida
+  const partnerCuits = useMemo(() => {
+    const s = new Set<string>();
+    for (const p of partners) {
+      if (p.cuit) s.add(normCuit(p.cuit));
+      if (p.dni) s.add(normCuit(p.dni));
+    }
+    return s;
+  }, [partners]);
+
+  // Mapa de CUIT/DNI → info del socio (para mostrar nombre en la tabla)
+  const partnerByDoc = useMemo(() => {
+    const m = new Map<string, Partner>();
+    for (const p of partners) {
+      if (p.cuit) m.set(normCuit(p.cuit), p);
+      if (p.dni) m.set(normCuit(p.dni), p);
+    }
+    return m;
+  }, [partners]);
+
+  // Detecta si un movimiento es de un socio (por match con CUIT o DNI cargado)
+  function isPartnerMovement(m: MovementEnriched): Partner | null {
+    if (!m.cuit_contraparte) return null;
+    const c = normCuit(m.cuit_contraparte);
+    if (partnerByDoc.has(c)) return partnerByDoc.get(c)!;
+    // Fallback: si el CUIT termina en un DNI del socio
+    for (const [doc, p] of partnerByDoc.entries()) {
+      if (doc.length <= 8 && c.endsWith(doc)) return p;
+    }
+    return null;
+  }
+
   const filteredBase = useMemo(() => {
     let rows = movements;
     if (banco !== "__todos__") rows = rows.filter(m => m.banco === banco);
     if (periodoEfectivo !== "__todos__") rows = rows.filter(m => ymKey(m.fecha) === periodoEfectivo);
     if (tipoParte === "propia")   rows = rows.filter(m => m.es_cuenta_propia);
-    if (tipoParte === "tercero")  rows = rows.filter(m => m.cuit_contraparte && !m.es_cuenta_propia);
+    if (tipoParte === "tercero")  rows = rows.filter(m => m.cuit_contraparte && !m.es_cuenta_propia && !isPartnerMovement(m));
+    if (tipoParte === "socios")   rows = rows.filter(m => isPartnerMovement(m) !== null);
     if (tipoParte === "sin_cuit") rows = rows.filter(m => !m.cuit_contraparte);
     if (q) {
       const s = q.toLowerCase();
@@ -128,8 +163,14 @@ export function BankClient({ movements: initial, invoices, statements, partners:
           .toLowerCase().includes(s)
       );
     }
-    return rows.slice().sort((a, b) => a.fecha.localeCompare(b.fecha));
-  }, [movements, banco, periodoEfectivo, tipoParte, q]);
+    // Enriquecer cada movimiento con la info del socio si coincide
+    const enriched = rows.map(m => {
+      const socio = isPartnerMovement(m);
+      if (!socio) return m;
+      return { ...m, socio_nombre: socio.nombre, socio_relacion: socio.relacion };
+    });
+    return enriched.slice().sort((a, b) => a.fecha.localeCompare(b.fecha));
+  }, [movements, banco, periodoEfectivo, tipoParte, q, partnerByDoc]);
 
   const totales = useMemo(() => {
     const ingresos = filteredBase.filter(m => m.tipo === "ingreso").reduce((a, b) => a + Number(b.monto), 0);
@@ -244,6 +285,7 @@ export function BankClient({ movements: initial, invoices, statements, partners:
               { k: "todos",    t: "Todas" },
               { k: "tercero",  t: "Terceros" },
               { k: "propia",   t: "Cuenta propia" },
+              { k: "socios",   t: `Socios${partners.length > 0 ? ` (${partners.length})` : ""}` },
               { k: "sin_cuit", t: "Sin CUIT" }
             ].map(o => (
               <div key={o.k} className={`tab ${tipoParte === o.k ? "active" : ""}`}
@@ -434,10 +476,14 @@ function MovementsTable({
                     <div className="flex flex-col" style={{ lineHeight: 1.2 }}>
                       <span className="text-[13px] font-medium truncate">
                         {m.nombre_contraparte || "—"}
-                        {m.es_cuenta_propia && <span className="ml-2"><Badge tone="info">Propia</Badge></span>}
-                        {!m.es_cuenta_propia && m.es_transferencia && <span className="ml-2"><Badge tone="default">Tercero</Badge></span>}
+                        {m.socio_nombre && <span className="ml-2"><Badge tone="warning">Socio</Badge></span>}
+                        {!m.socio_nombre && m.es_cuenta_propia && <span className="ml-2"><Badge tone="info">Propia</Badge></span>}
+                        {!m.socio_nombre && !m.es_cuenta_propia && m.es_transferencia && <span className="ml-2"><Badge tone="default">Tercero</Badge></span>}
                       </span>
-                      <span className="text-[11px] text-ink-3 font-mono">{formatCuitDisplay(m.cuit_contraparte)}</span>
+                      <span className="text-[11px] text-ink-3 font-mono">
+                        {formatCuitDisplay(m.cuit_contraparte)}
+                        {m.socio_nombre && <span className="ml-2 text-[11px] text-ink-3">· {m.socio_nombre}{m.socio_relacion ? ` (${m.socio_relacion})` : ""}</span>}
+                      </span>
                     </div>
                   ) : (
                     <span className="text-[12px] text-ink-3">—</span>
