@@ -592,6 +592,43 @@ function InvoiceDetail({
                 </span>
               </div>
             )}
+            {form.moneda !== "ARS" && (
+              <div className="mt-3">
+                <button
+                  className="btn btn-ghost w-full justify-center"
+                  onClick={() => {
+                    const tc = Number(form.tipo_cambio.replace(",", ".")) || 1;
+                    if (tc <= 0) { alert("Poné un tipo de cambio mayor a 0"); return; }
+                    const conf = confirm(
+                      `Recalcular todos los importes multiplicando por TC ${tc}?\n\n` +
+                      `Los importes actuales del formulario se tratarán como ${form.moneda}, y se convertirán a ARS multiplicando por ${tc}.\n\n` +
+                      `Ejemplo: si Neto Gravado = 1.000, va a quedar en ${(1000 * tc).toLocaleString("es-AR")} ARS.`
+                    );
+                    if (!conf) return;
+                    const num = (v: string) => Number(v.replace(",", ".")) || 0;
+                    const mul = (v: string) => (num(v) * tc).toFixed(2);
+                    setForm({
+                      ...form,
+                      neto_gravado: mul(form.neto_gravado),
+                      iva_21:       mul(form.iva_21),
+                      iva_10_5:     mul(form.iva_10_5),
+                      iva_27:       mul(form.iva_27),
+                      iva_otros:    mul(form.iva_otros),
+                      percepciones: mul(form.percepciones),
+                      total:        mul(form.total)
+                    });
+                    setMsg(`Importes multiplicados por TC ${tc}. Ahora hacé click en "Guardar cambios" para confirmar.`);
+                  }}
+                  style={{ background: "linear-gradient(135deg,#fde68a,#fcd34d)", color: "#7c2d12", borderColor: "#fcd34d" }}
+                >
+                  <Icon.Sparkles/> Recalcular importes × TC {form.tipo_cambio || "?"}
+                </button>
+                <div className="text-[11px] text-ink-3 mt-1 text-center leading-snug">
+                  Usalo si la factura fue cargada en pesos pero era en {form.moneda}.<br/>
+                  Toma los valores actuales como {form.moneda} y los multiplica por el TC.
+                </div>
+              </div>
+            )}
           </Section>
 
           <Section title={form.moneda === "ARS" ? "Importes (ARS)" : `Importes convertidos a ARS`}>
