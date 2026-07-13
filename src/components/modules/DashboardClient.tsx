@@ -34,6 +34,7 @@ export function DashboardClient({ invoices: initial, annual, company }: Props) {
   const [detail, setDetail] = useState<Invoice | null>(null);
   const [anio, setAnio] = useState<string>("__todos__");
   const [mes, setMes] = useState<string>("__todos__"); // "__todos__" | "YYYY-MM"
+  const [showFilesModal, setShowFilesModal] = useState(false);
 
   // Años disponibles en los datos reales
   const aniosDisponibles = useMemo(() => {
@@ -190,24 +191,43 @@ export function DashboardClient({ invoices: initial, annual, company }: Props) {
         )}
 
         {/* Filtros venta/compra + búsqueda + switch a gráfico anual */}
-        <div className="card p-3 flex flex-wrap items-center gap-3">
-          <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
-            <div className={`tab ${tab==="mensual"?"active":""}`} onClick={()=>setTab("mensual")}>Libro</div>
-            <div className={`tab ${tab==="anual"?"active":""}`} onClick={()=>setTab("anual")}>Gráfico anual</div>
+        <div className="card p-3 space-y-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
+              <div className={`tab ${tab==="mensual"?"active":""}`} onClick={()=>setTab("mensual")}>Libro</div>
+              <div className={`tab ${tab==="anual"?"active":""}`} onClick={()=>setTab("anual")}>Gráfico anual</div>
+            </div>
+            {tab === "mensual" && (
+              <>
+                <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
+                  {[{k:"todos",t:"Todos"},{k:"venta",t:"Ventas"},{k:"compra",t:"Compras"}].map(o => (
+                    <div key={o.k} className={`tab ${filter===o.k?"active":""}`} onClick={()=>setFilter(o.k as any)}>{o.t}</div>
+                  ))}
+                </div>
+                <div className="flex-1 min-w-[240px] relative">
+                  <div className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3"><Icon.Search /></div>
+                  <input className="input pl-9" placeholder="Buscar razón social, CUIT o comprobante…"
+                         value={q} onChange={e=>setQ(e.target.value)} />
+                </div>
+              </>
+            )}
           </div>
           {tab === "mensual" && (
-            <>
-              <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
-                {[{k:"todos",t:"Todos"},{k:"venta",t:"Ventas"},{k:"compra",t:"Compras"}].map(o => (
-                  <div key={o.k} className={`tab ${filter===o.k?"active":""}`} onClick={()=>setFilter(o.k as any)}>{o.t}</div>
-                ))}
+            <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-line" style={{ paddingTop: 10 }}>
+              <button
+                className="btn btn-ghost"
+                onClick={() => setShowFilesModal(true)}
+                title="Ver los archivos originales (PDF/Excel) que la IA analizó — útil para control manual del contador"
+              >
+                <Icon.Folder /> Ver archivos originales
+                <span className="ml-1 chip" style={{ background:"var(--accent-soft)", color:"var(--accent)", fontSize:11, padding:"1px 8px" }}>
+                  {new Set(filtered.map(i => i.storage_path).filter(Boolean)).size}
+                </span>
+              </button>
+              <div className="text-[11px] text-ink-3">
+                Base de datos de archivos usados por la IA — para auditoría contable manual
               </div>
-              <div className="flex-1 min-w-[240px] relative">
-                <div className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3"><Icon.Search /></div>
-                <input className="input pl-9" placeholder="Buscar razón social, CUIT o comprobante…"
-                       value={q} onChange={e=>setQ(e.target.value)} />
-              </div>
-            </>
+            </div>
           )}
         </div>
 
@@ -259,6 +279,15 @@ export function DashboardClient({ invoices: initial, annual, company }: Props) {
             setDetail(null);
             router.refresh();
           }}
+        />
+      )}
+
+      {showFilesModal && (
+        <InvoiceFilesModal
+          invoicesFiltered={filtered}
+          invoicesAll={invoices}
+          onClose={() => setShowFilesModal(false)}
+          contextLabel={`${anioActivoLabel} · ${mesActivoLabel}${filter !== "todos" ? ` · ${filter === "venta" ? "Ventas" : "Compras"}` : ""}`}
         />
       )}
     </>
@@ -335,7 +364,7 @@ function InvoiceDetail({
   async function save() {
     setErr(null); setMsg(null); setSaving(true);
     try {
-      const num = (v: string) => Number(v.replace(",", ".")) || 0;
+      const num = parseNumEs;
       const res = await fetch("/api/invoice/update", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -597,16 +626,22 @@ function InvoiceDetail({
                 <button
                   className="btn btn-ghost w-full justify-center"
                   onClick={() => {
-                    const tc = Number(form.tipo_cambio.replace(",", ".")) || 1;
+                    const tc = parseNumEs(form.tipo_cambio);
                     if (tc <= 0) { alert("Poné un tipo de cambio mayor a 0"); return; }
+                    // Preview de los cálculos para verificar antes de aplicar
+                    const previewNeto  = parseNumEs(form.neto_gravado) * tc;
+                    const previewTotal = parseNumEs(form.total) * tc;
                     const conf = confirm(
-                      `Recalcular todos los importes multiplicando por TC ${tc}?\n\n` +
-                      `Los importes actuales del formulario se tratarán como ${form.moneda}, y se convertirán a ARS multiplicando por ${tc}.\n\n` +
-                      `Ejemplo: si Neto Gravado = 1.000, va a quedar en ${(1000 * tc).toLocaleString("es-AR")} ARS.`
+                      `Recalcular importes multiplicando por TC ${tc.toLocaleString("es-AR")}?\n\n` +
+                      `Ejemplo con tus valores:\n` +
+                      `  Neto Gravado: ${parseNumEs(form.neto_gravado).toLocaleString("es-AR")} ${form.moneda}\n` +
+                      `                → ${previewNeto.toLocaleString("es-AR", {maximumFractionDigits: 2})} ARS\n\n` +
+                      `  Total: ${parseNumEs(form.total).toLocaleString("es-AR")} ${form.moneda}\n` +
+                      `        → ${previewTotal.toLocaleString("es-AR", {maximumFractionDigits: 2})} ARS`
                     );
                     if (!conf) return;
-                    const num = (v: string) => Number(v.replace(",", ".")) || 0;
-                    const mul = (v: string) => (num(v) * tc).toFixed(2);
+                    // Usamos toFixed(2) para forzar 2 decimales, formato numeric (punto como decimal para JS)
+                    const mul = (v: string) => (parseNumEs(v) * tc).toFixed(2);
                     setForm({
                       ...form,
                       neto_gravado: mul(form.neto_gravado),
@@ -617,7 +652,7 @@ function InvoiceDetail({
                       percepciones: mul(form.percepciones),
                       total:        mul(form.total)
                     });
-                    setMsg(`Importes multiplicados por TC ${tc}. Ahora hacé click en "Guardar cambios" para confirmar.`);
+                    setMsg(`✓ Importes multiplicados por TC ${tc.toLocaleString("es-AR")}. Hacé click en "Guardar cambios" para confirmar.`);
                   }}
                   style={{ background: "linear-gradient(135deg,#fde68a,#fcd34d)", color: "#7c2d12", borderColor: "#fcd34d" }}
                 >
@@ -695,6 +730,49 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
     </div>
   );
 }
+/**
+ * Parser robusto que acepta números en formato argentino/inglés:
+ *   "1.234,50"   → 1234.50   (formato ES con puntos de miles y coma decimal)
+ *   "1234,50"    → 1234.50   (solo coma decimal ES)
+ *   "1,234.50"   → 1234.50   (formato EN con comas de miles y punto decimal)
+ *   "1234.50"    → 1234.50   (formato EN simple)
+ *   "1000"       → 1000
+ *   "1.234.567"  → 1234567   (solo puntos, se interpretan como miles)
+ */
+function parseNumEs(v: string): number {
+  if (!v) return 0;
+  let s = String(v).trim();
+  if (!s) return 0;
+  // Sacar símbolos de moneda y espacios
+  s = s.replace(/[$\s€]/g, "");
+  const hasComma = s.includes(",");
+  const hasDot   = s.includes(".");
+  if (hasComma && hasDot) {
+    // Ambos → el ÚLTIMO es el decimal, el otro es separador de miles
+    const lastComma = s.lastIndexOf(",");
+    const lastDot   = s.lastIndexOf(".");
+    if (lastComma > lastDot) {
+      // Coma es decimal (formato ES: 1.234,50)
+      s = s.replace(/\./g, "").replace(",", ".");
+    } else {
+      // Punto es decimal (formato EN: 1,234.50)
+      s = s.replace(/,/g, "");
+    }
+  } else if (hasComma) {
+    // Solo coma → asumo decimal español
+    s = s.replace(",", ".");
+  } else if (hasDot) {
+    // Solo puntos: si hay más de uno, son miles. Si hay uno solo y viene con 3+ dígitos, es miles.
+    const dots = (s.match(/\./g) ?? []).length;
+    if (dots > 1) {
+      s = s.replace(/\./g, "");
+    }
+    // Si es solo uno, dejamos como decimal (ej "1234.50")
+  }
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
 function NumInp({ value, onChange, bold }: { value: string; onChange: (v: string) => void; bold?: boolean }) {
   return (
     <input
@@ -1187,5 +1265,280 @@ function ArcaCsvDropzone({ onDone }: { onDone: () => void }) {
                onChange={(e) => handle(e.target.files)}/>
       </div>
     </div>
+  );
+}
+
+// ============================================================================
+// Modal: Base de datos de archivos originales (para control manual del contador)
+// ============================================================================
+
+type FileGroup = {
+  storage_path: string;
+  facturas: Invoice[];
+  tipo: "individual" | "listado_arca" | "csv_arca" | "otro";
+  extension: string;
+  filename: string;
+  fecha_carga: string | null;
+  fecha_primera_factura: string | null;
+  fecha_ultima_factura: string | null;
+  total_ars: number;
+  primer_id: string;
+};
+
+function detectFileTipo(path: string): FileGroup["tipo"] {
+  const p = path.toLowerCase();
+  if (p.includes("arca-list")) return "listado_arca";
+  if (p.includes("arca-csv") || p.endsWith(".csv") || p.endsWith(".xlsx") || p.endsWith(".xls")) return "csv_arca";
+  if (p.endsWith(".pdf") || p.endsWith(".jpg") || p.endsWith(".jpeg") || p.endsWith(".png")) return "individual";
+  return "otro";
+}
+
+function InvoiceFilesModal({
+  invoicesFiltered, invoicesAll, onClose, contextLabel
+}: {
+  invoicesFiltered: Invoice[];
+  invoicesAll: Invoice[];
+  onClose: () => void;
+  contextLabel: string;
+}) {
+  const [scope, setScope] = useState<"periodo" | "todos">("periodo");
+  const [q, setQ] = useState("");
+  const [tipoFiltro, setTipoFiltro] = useState<"todos" | FileGroup["tipo"]>("todos");
+  const [loadingId, setLoadingId] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const source = scope === "periodo" ? invoicesFiltered : invoicesAll;
+
+  // Agrupar por storage_path
+  const groups = useMemo<FileGroup[]>(() => {
+    const map = new Map<string, Invoice[]>();
+    for (const inv of source) {
+      if (!inv.storage_path) continue;
+      if (!map.has(inv.storage_path)) map.set(inv.storage_path, []);
+      map.get(inv.storage_path)!.push(inv);
+    }
+    const out: FileGroup[] = [];
+    for (const [path, facts] of map.entries()) {
+      const ext = (path.split(".").pop() || "").toLowerCase();
+      const filename = path.split("/").pop() || path;
+      const tipo = detectFileTipo(path);
+      const fechas = facts.map(f => f.fecha).filter(Boolean).sort();
+      const total = facts.reduce((a, b) => a + Number(b.total ?? 0), 0);
+      out.push({
+        storage_path: path,
+        facturas: facts,
+        tipo,
+        extension: ext,
+        filename,
+        fecha_carga: (facts[0] as any).created_at ?? null,
+        fecha_primera_factura: fechas[0] ?? null,
+        fecha_ultima_factura: fechas[fechas.length - 1] ?? null,
+        total_ars: total,
+        primer_id: facts[0].id
+      });
+    }
+    // Ordenar por fecha última desc
+    return out.sort((a, b) => (b.fecha_ultima_factura ?? "").localeCompare(a.fecha_ultima_factura ?? ""));
+  }, [source]);
+
+  const filteredGroups = useMemo(() => {
+    return groups.filter(g => {
+      if (tipoFiltro !== "todos" && g.tipo !== tipoFiltro) return false;
+      if (q) {
+        const s = q.toLowerCase();
+        const razonHit = g.facturas.some(f => (f.razon_social ?? "").toLowerCase().includes(s));
+        const cuitHit  = g.facturas.some(f => (f.cuit ?? "").toLowerCase().includes(s));
+        const compHit  = g.facturas.some(f => (f.comprobante ?? "").toLowerCase().includes(s));
+        if (!(g.filename.toLowerCase().includes(s) || razonHit || cuitHit || compHit)) return false;
+      }
+      return true;
+    });
+  }, [groups, q, tipoFiltro]);
+
+  const counts = useMemo(() => ({
+    todos: groups.length,
+    individual: groups.filter(g => g.tipo === "individual").length,
+    listado_arca: groups.filter(g => g.tipo === "listado_arca").length,
+    csv_arca: groups.filter(g => g.tipo === "csv_arca").length,
+    otro: groups.filter(g => g.tipo === "otro").length
+  }), [groups]);
+
+  const totalFacturas = filteredGroups.reduce((a, g) => a + g.facturas.length, 0);
+
+  async function openFile(g: FileGroup) {
+    setLoadingId(g.storage_path); setErr(null);
+    try {
+      const r = await fetch(`/api/invoice/file?id=${encodeURIComponent(g.primer_id)}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      window.open(d.url, "_blank");
+    } catch (e: any) {
+      setErr("No se pudo abrir el archivo: " + e.message);
+    } finally { setLoadingId(null); }
+  }
+
+  const tipoLabel: Record<FileGroup["tipo"], string> = {
+    individual:    "Factura individual",
+    listado_arca:  "Listado ARCA (PDF)",
+    csv_arca:      "Excel/CSV ARCA",
+    otro:          "Otro"
+  };
+
+  const tipoBadgeTone: Record<FileGroup["tipo"], any> = {
+    individual:   "info",
+    listado_arca: "impuesto",
+    csv_arca:     "success",
+    otro:         "default"
+  };
+
+  return (
+    <>
+      <div className="modal-back" style={{ zIndex: 60 }} onClick={onClose}/>
+      <div className="fixed inset-4 md:inset-10 card soft fade-in overflow-hidden flex flex-col" style={{ zIndex: 70 }}>
+        <div className="px-6 py-5 border-b border-line flex items-start justify-between gap-4">
+          <div>
+            <div className="text-[12px] uppercase tracking-wider text-ink-3">Base de datos de archivos</div>
+            <div className="sf-display text-[22px] font-semibold mt-1">Archivos originales analizados por IA</div>
+            <div className="text-[12px] text-ink-3 mt-1 max-w-2xl">
+              Todos los PDF, Excel y CSV que la IA usó para generar el libro de IVA.
+              Cada archivo puede contener una o varias facturas — hacé clic en <b>Ver</b> para abrir el original y hacer el control manual contra los datos cargados.
+            </div>
+          </div>
+          <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}><Icon.Close/></button>
+        </div>
+
+        {/* Filtros */}
+        <div className="px-6 py-4 border-b border-line flex flex-wrap items-center gap-3">
+          <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
+            <div className={`tab ${scope==="periodo"?"active":""}`} onClick={()=>setScope("periodo")}>
+              {contextLabel}
+            </div>
+            <div className={`tab ${scope==="todos"?"active":""}`} onClick={()=>setScope("todos")}>
+              Todos los períodos
+            </div>
+          </div>
+
+          <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
+            {[
+              { k: "todos", t: "Todos", c: counts.todos },
+              { k: "individual", t: "Individuales", c: counts.individual },
+              { k: "listado_arca", t: "Listados ARCA", c: counts.listado_arca },
+              { k: "csv_arca", t: "Excel/CSV", c: counts.csv_arca }
+            ].map(o => (
+              <div key={o.k}
+                   className={`tab ${tipoFiltro===o.k?"active":""}`}
+                   onClick={()=>setTipoFiltro(o.k as any)}>
+                {o.t}<span className="ml-1 text-[10px] text-ink-3">· {o.c}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex-1 min-w-[240px] relative">
+            <div className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3"><Icon.Search /></div>
+            <input className="input pl-9" placeholder="Buscar por archivo, razón social, CUIT o comprobante…"
+                   value={q} onChange={e=>setQ(e.target.value)} />
+          </div>
+        </div>
+
+        {err && (
+          <div className="mx-6 mt-3 p-2.5 rounded-lg bg-[#fdeaef] text-[#9c2944] text-[12px]">{err}</div>
+        )}
+
+        {/* KPIs */}
+        <div className="grid grid-cols-3 gap-3 px-6 py-4 border-b border-line" style={{ background: "#fafafa" }}>
+          <div className="rounded-xl p-3 bg-white">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Archivos únicos</div>
+            <div className="sf-display text-[22px] font-semibold mt-1">{filteredGroups.length}</div>
+          </div>
+          <div className="rounded-xl p-3 bg-white">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Facturas contenidas</div>
+            <div className="sf-display text-[22px] font-semibold mt-1">{totalFacturas}</div>
+          </div>
+          <div className="rounded-xl p-3 bg-white">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Total ARS</div>
+            <div className="sf-display text-[22px] font-semibold mt-1">{money(filteredGroups.reduce((a, g) => a + g.total_ars, 0))}</div>
+          </div>
+        </div>
+
+        {/* Lista de archivos */}
+        <div className="flex-1 overflow-y-auto scroll-clean">
+          {filteredGroups.length === 0 ? (
+            <div className="p-16 text-center text-ink-3">
+              <div className="w-14 h-14 mx-auto rounded-2xl flex items-center justify-center bg-brand-soft text-brand mb-3">
+                <Icon.Folder/>
+              </div>
+              <div className="sf-display text-[15px] font-semibold text-ink-1">No hay archivos con estos filtros</div>
+              <div className="text-[12px] mt-1">Cambiá el filtro o el ámbito para ver más resultados.</div>
+            </div>
+          ) : (
+            <table className="clean">
+              <thead>
+                <tr>
+                  <th>Archivo</th>
+                  <th>Tipo</th>
+                  <th>Período que cubre</th>
+                  <th className="text-right">Facturas</th>
+                  <th className="text-right">Total ARS</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredGroups.map(g => (
+                  <tr key={g.storage_path}>
+                    <td>
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
+                             style={{
+                               background:
+                                 g.tipo === "csv_arca" ? "#e6f6ed" :
+                                 g.tipo === "listado_arca" ? "#efeaff" : "var(--accent-soft)",
+                               color:
+                                 g.tipo === "csv_arca" ? "#30a46c" :
+                                 g.tipo === "listado_arca" ? "#7c5cff" : "var(--accent)"
+                             }}>
+                          <Icon.File/>
+                        </div>
+                        <div className="min-w-0">
+                          <div className="font-medium truncate" style={{ maxWidth: 360 }} title={g.filename}>
+                            {g.filename}
+                          </div>
+                          <div className="text-[11px] text-ink-3 font-mono truncate" style={{ maxWidth: 360 }} title={g.storage_path}>
+                            {g.storage_path}
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td>
+                      <Badge tone={tipoBadgeTone[g.tipo]}>{tipoLabel[g.tipo]}</Badge>
+                    </td>
+                    <td className="text-ink-2 text-[12px]">
+                      {g.fecha_primera_factura === g.fecha_ultima_factura
+                        ? g.fecha_primera_factura ?? "—"
+                        : `${g.fecha_primera_factura ?? "?"} → ${g.fecha_ultima_factura ?? "?"}`}
+                    </td>
+                    <td className="text-right">
+                      <span className="chip" style={{ background:"var(--accent-soft)", color:"var(--accent)" }}>
+                        {g.facturas.length}
+                      </span>
+                    </td>
+                    <td className="text-right font-semibold">{money(g.total_ars)}</td>
+                    <td className="text-right">
+                      <button
+                        className="btn btn-primary"
+                        style={{ padding:"6px 12px", fontSize: 12 }}
+                        onClick={() => openFile(g)}
+                        disabled={loadingId === g.storage_path}
+                      >
+                        {loadingId === g.storage_path ? "Abriendo…" : <><Icon.Link/> Ver</>}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </>
   );
 }
