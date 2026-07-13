@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Topbar } from "@/components/ui/Topbar";
 import { Kpi } from "@/components/ui/Kpi";
@@ -11,10 +11,23 @@ import { MobileHero } from "@/components/ui/MobileHero";
 import { money, periodoMesLabel } from "@/lib/format";
 import type { Invoice, Company } from "@/lib/supabase/types";
 
+type FileReview = {
+  id: string;
+  company_id: string;
+  storage_path: string;
+  reviewed_by: string;
+  reviewed_at: string;
+  note: string | null;
+  status: "ok" | "con_observacion" | "con_error";
+};
+type Reviewer = { id: string; email: string | null; full_name: string | null };
+
 type Props = {
   invoices: Invoice[];
   annual: { m: string; debito: number; credito: number }[];
   company: Company | null;
+  fileReviews?: FileReview[];
+  reviewers?: Reviewer[];
 };
 
 const MESES_ABREV = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
@@ -25,9 +38,10 @@ function ymLabel(ym: string) {
   return `${MESES_ABREV[Number(m) - 1] ?? ""} ${y}`;
 }
 
-export function DashboardClient({ invoices: initial, annual, company }: Props) {
+export function DashboardClient({ invoices: initial, annual, company, fileReviews: initialReviews = [], reviewers = [] }: Props) {
   const router = useRouter();
   const [invoices, setInvoices] = useState<Invoice[]>(initial);
+  const [fileReviews, setFileReviews] = useState<FileReview[]>(initialReviews);
   const [tab, setTab] = useState<"mensual"|"anual">("mensual");
   const [filter, setFilter] = useState<"todos"|"venta"|"compra">("todos");
   const [q, setQ] = useState("");
@@ -219,13 +233,22 @@ export function DashboardClient({ invoices: initial, annual, company }: Props) {
                 onClick={() => setShowFilesModal(true)}
                 title="Ver los archivos originales (PDF/Excel) que la IA analizó — útil para control manual del contador"
               >
-                <Icon.Folder /> Ver archivos originales
+                <Icon.Folder /> Archivos originales
                 <span className="ml-1 chip" style={{ background:"var(--accent-soft)", color:"var(--accent)", fontSize:11, padding:"1px 8px" }}>
                   {new Set(filtered.map(i => i.storage_path).filter(Boolean)).size}
                 </span>
               </button>
+              {(() => {
+                const sinArchivo = filtered.filter(i => !i.storage_path).length;
+                if (!sinArchivo) return null;
+                return (
+                  <span className="chip" style={{ background:"#fcf0dd", color:"#b4730e", fontSize:11 }}>
+                    {sinArchivo} sin archivo original
+                  </span>
+                );
+              })()}
               <div className="text-[11px] text-ink-3">
-                Base de datos de archivos usados por la IA — para auditoría contable manual
+                Auditoría contable · revisá y marcá los archivos que la IA procesó
               </div>
             </div>
           )}
@@ -288,6 +311,18 @@ export function DashboardClient({ invoices: initial, annual, company }: Props) {
           invoicesAll={invoices}
           onClose={() => setShowFilesModal(false)}
           contextLabel={`${anioActivoLabel} · ${mesActivoLabel}${filter !== "todos" ? ` · ${filter === "venta" ? "Ventas" : "Compras"}` : ""}`}
+          currentYear={anio === "__todos__" ? null : anio}
+          currentMonth={mesEfectivo === "__todos__" ? null : mesEfectivo.split("-")[1]}
+          currentTipo={filter}
+          reviews={fileReviews}
+          reviewers={reviewers}
+          onReviewChange={(path, review) => {
+            setFileReviews(prev => {
+              const filtered = prev.filter(r => r.storage_path !== path);
+              return review ? [...filtered, review] : filtered;
+            });
+          }}
+          onOpenInvoice={(inv) => { setDetail(inv); setShowFilesModal(false); }}
         />
       )}
     </>
@@ -1282,7 +1317,8 @@ type FileGroup = {
   fecha_primera_factura: string | null;
   fecha_ultima_factura: string | null;
   total_ars: number;
-  primer_id: string;
+  ai_confidence_min: number;
+  status_worst: "revision" | "aprobada" | "otro";
 };
 
 function detectFileTipo(path: string): FileGroup["tipo"] {
@@ -1293,21 +1329,79 @@ function detectFileTipo(path: string): FileGroup["tipo"] {
   return "otro";
 }
 
+function isPreviewable(path: string): "pdf" | "image" | "excel" | "csv" | "otro" {
+  const p = path.toLowerCase();
+  if (p.endsWith(".pdf")) return "pdf";
+  if (p.endsWith(".png") || p.endsWith(".jpg") || p.endsWith(".jpeg") || p.endsWith(".webp")) return "image";
+  if (p.endsWith(".xlsx") || p.endsWith(".xls")) return "excel";
+  if (p.endsWith(".csv")) return "csv";
+  return "otro";
+}
+
 function InvoiceFilesModal({
-  invoicesFiltered, invoicesAll, onClose, contextLabel
+  invoicesFiltered, invoicesAll, onClose, contextLabel,
+  currentYear, currentMonth, currentTipo,
+  reviews, reviewers, onReviewChange, onOpenInvoice
 }: {
   invoicesFiltered: Invoice[];
   invoicesAll: Invoice[];
   onClose: () => void;
   contextLabel: string;
+  currentYear: string | null;
+  currentMonth: string | null;
+  currentTipo: "todos" | "venta" | "compra";
+  reviews: FileReview[];
+  reviewers: Reviewer[];
+  onReviewChange: (path: string, review: FileReview | null) => void;
+  onOpenInvoice: (inv: Invoice) => void;
 }) {
   const [scope, setScope] = useState<"periodo" | "todos">("periodo");
   const [q, setQ] = useState("");
   const [tipoFiltro, setTipoFiltro] = useState<"todos" | FileGroup["tipo"]>("todos");
+  const [estadoFiltro, setEstadoFiltro] = useState<"todos" | "sin_revisar" | "ok" | "observaciones">("todos");
+  const [orderBy, setOrderBy] = useState<"fecha" | "facturas" | "total" | "confianza">("fecha");
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [preview, setPreview] = useState<{ path: string; url: string; kind: string; filename: string } | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [reviewEditing, setReviewEditing] = useState<string | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
+  const [downloadingZip, setDownloadingZip] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [backfillPreview, setBackfillPreview] = useState<null | {
+    archivos: number;
+    facturas: number;
+    ejemplos: { after: string; facturas: number }[];
+  }>(null);
+  const [backfillRunning, setBackfillRunning] = useState(false);
+  const [backfillDone, setBackfillDone] = useState<null | { archivos: number; facturas: number }>(null);
+
+  // Cerrar con ESC
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (preview) setPreview(null);
+        else if (reviewEditing) setReviewEditing(null);
+        else onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, preview, reviewEditing]);
+
+  const reviewByPath = useMemo(() => {
+    const m = new Map<string, FileReview>();
+    for (const r of reviews) m.set(r.storage_path, r);
+    return m;
+  }, [reviews]);
+
+  const reviewerById = useMemo(() => {
+    const m = new Map<string, Reviewer>();
+    for (const u of reviewers) m.set(u.id, u);
+    return m;
+  }, [reviewers]);
 
   const source = scope === "periodo" ? invoicesFiltered : invoicesAll;
+  const facturasSinArchivo = source.filter(i => !i.storage_path);
 
   // Agrupar por storage_path
   const groups = useMemo<FileGroup[]>(() => {
@@ -1320,67 +1414,242 @@ function InvoiceFilesModal({
     const out: FileGroup[] = [];
     for (const [path, facts] of map.entries()) {
       const ext = (path.split(".").pop() || "").toLowerCase();
-      const filename = path.split("/").pop() || path;
+      const filename = (facts[0].original_filename as any) || path.split("/").pop() || path;
       const tipo = detectFileTipo(path);
       const fechas = facts.map(f => f.fecha).filter(Boolean).sort();
       const total = facts.reduce((a, b) => a + Number(b.total ?? 0), 0);
+      const cargas = facts.map(f => (f as any).created_at).filter(Boolean).sort();
+      const confMin = facts.reduce((a, b) => Math.min(a, Number(b.ai_confidence ?? 1)), 1);
+      const anyRevision = facts.some(f => f.status === "revision");
       out.push({
         storage_path: path,
         facturas: facts,
         tipo,
         extension: ext,
         filename,
-        fecha_carga: (facts[0] as any).created_at ?? null,
+        fecha_carga: cargas[0] ?? null,
         fecha_primera_factura: fechas[0] ?? null,
         fecha_ultima_factura: fechas[fechas.length - 1] ?? null,
         total_ars: total,
-        primer_id: facts[0].id
+        ai_confidence_min: confMin,
+        status_worst: anyRevision ? "revision" : "aprobada"
       });
     }
-    // Ordenar por fecha última desc
-    return out.sort((a, b) => (b.fecha_ultima_factura ?? "").localeCompare(a.fecha_ultima_factura ?? ""));
+    return out;
   }, [source]);
 
   const filteredGroups = useMemo(() => {
-    return groups.filter(g => {
+    const norm = (s: string) => s.toLowerCase();
+    const rows = groups.filter(g => {
       if (tipoFiltro !== "todos" && g.tipo !== tipoFiltro) return false;
+      if (estadoFiltro !== "todos") {
+        const rev = reviewByPath.get(g.storage_path);
+        if (estadoFiltro === "sin_revisar" && rev) return false;
+        if (estadoFiltro === "ok" && (!rev || rev.status !== "ok")) return false;
+        if (estadoFiltro === "observaciones" && (!rev || rev.status === "ok")) return false;
+      }
       if (q) {
-        const s = q.toLowerCase();
-        const razonHit = g.facturas.some(f => (f.razon_social ?? "").toLowerCase().includes(s));
-        const cuitHit  = g.facturas.some(f => (f.cuit ?? "").toLowerCase().includes(s));
-        const compHit  = g.facturas.some(f => (f.comprobante ?? "").toLowerCase().includes(s));
-        if (!(g.filename.toLowerCase().includes(s) || razonHit || cuitHit || compHit)) return false;
+        const s = norm(q);
+        const razonHit = g.facturas.some(f => norm(f.razon_social ?? "").includes(s));
+        const cuitHit  = g.facturas.some(f => norm(f.cuit ?? "").includes(s));
+        const compHit  = g.facturas.some(f => norm(f.comprobante ?? "").includes(s));
+        if (!(norm(g.filename).includes(s) || razonHit || cuitHit || compHit)) return false;
       }
       return true;
     });
-  }, [groups, q, tipoFiltro]);
+    // Ordenar
+    rows.sort((a, b) => {
+      switch (orderBy) {
+        case "fecha":     return (b.fecha_ultima_factura ?? "").localeCompare(a.fecha_ultima_factura ?? "");
+        case "facturas":  return b.facturas.length - a.facturas.length;
+        case "total":     return b.total_ars - a.total_ars;
+        case "confianza": return a.ai_confidence_min - b.ai_confidence_min;
+      }
+    });
+    return rows;
+  }, [groups, q, tipoFiltro, estadoFiltro, orderBy, reviewByPath]);
 
   const counts = useMemo(() => ({
     todos: groups.length,
     individual: groups.filter(g => g.tipo === "individual").length,
     listado_arca: groups.filter(g => g.tipo === "listado_arca").length,
     csv_arca: groups.filter(g => g.tipo === "csv_arca").length,
-    otro: groups.filter(g => g.tipo === "otro").length
-  }), [groups]);
+    otro: groups.filter(g => g.tipo === "otro").length,
+    sin_revisar: groups.filter(g => !reviewByPath.get(g.storage_path)).length,
+    revisados_ok: groups.filter(g => reviewByPath.get(g.storage_path)?.status === "ok").length,
+    con_obs: groups.filter(g => {
+      const r = reviewByPath.get(g.storage_path);
+      return r && r.status !== "ok";
+    }).length
+  }), [groups, reviewByPath]);
 
   const totalFacturas = filteredGroups.reduce((a, g) => a + g.facturas.length, 0);
+  const totalAmount = filteredGroups.reduce((a, g) => a + g.total_ars, 0);
 
-  async function openFile(g: FileGroup) {
+  async function openPreview(g: FileGroup, download = false) {
     setLoadingId(g.storage_path); setErr(null);
     try {
-      const r = await fetch(`/api/invoice/file?id=${encodeURIComponent(g.primer_id)}`);
+      const url = `/api/invoice/file?path=${encodeURIComponent(g.storage_path)}${download ? "&download=1" : ""}`;
+      const r = await fetch(url);
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-      window.open(d.url, "_blank");
+      if (download) {
+        // Descarga directa: abrimos la signed URL con Content-Disposition:attachment
+        window.location.href = d.url;
+      } else {
+        const kind = isPreviewable(g.storage_path);
+        if (kind === "pdf" || kind === "image") {
+          setPreview({ path: g.storage_path, url: d.url, kind, filename: g.filename });
+        } else {
+          // Excel/CSV: no se puede embeber → abrir en nueva pestaña
+          window.open(d.url, "_blank");
+        }
+      }
     } catch (e: any) {
       setErr("No se pudo abrir el archivo: " + e.message);
     } finally { setLoadingId(null); }
   }
 
+  async function saveReview(path: string, status: FileReview["status"], note: string) {
+    setErr(null);
+    try {
+      const r = await fetch("/api/file-review", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ storage_path: path, status, note })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      onReviewChange(path, d.review);
+      setReviewEditing(null);
+    } catch (e: any) {
+      setErr("No se pudo guardar la revisión: " + e.message);
+    }
+  }
+
+  async function unreview(path: string) {
+    if (!confirm("¿Quitar la marca de revisado?")) return;
+    setErr(null);
+    try {
+      const r = await fetch(`/api/file-review?storage_path=${encodeURIComponent(path)}`, { method: "DELETE" });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      onReviewChange(path, null);
+    } catch (e: any) {
+      setErr("No se pudo quitar la revisión: " + e.message);
+    }
+  }
+
+  function toggleSelect(path: string) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path); else next.add(path);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    if (selected.size === filteredGroups.length) setSelected(new Set());
+    else setSelected(new Set(filteredGroups.map(g => g.storage_path)));
+  }
+
+  function exportExcel() {
+    const params = new URLSearchParams();
+    if (scope === "periodo") {
+      if (currentYear) params.set("year", currentYear);
+      if (currentMonth) params.set("month", currentMonth);
+      if (currentTipo !== "todos") params.set("tipo", currentTipo);
+    }
+    window.location.href = `/api/invoice-files/export?${params.toString()}`;
+  }
+
+  async function downloadZip() {
+    const paths = selected.size ? Array.from(selected) : filteredGroups.map(g => g.storage_path);
+    if (!paths.length) return;
+    if (paths.length > 200) {
+      setErr("El ZIP soporta hasta 200 archivos. Ajustá los filtros o seleccioná menos.");
+      return;
+    }
+    setDownloadingZip(true); setErr(null);
+    try {
+      const r = await fetch("/api/invoice-files/zip", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paths })
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        throw new Error(d.error || `HTTP ${r.status}`);
+      }
+      const blob = await r.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `archivos-originales-${new Date().toISOString().slice(0, 10)}.zip`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      const failed = r.headers.get("X-Files-Failed");
+      if (failed && failed !== "0") setErr(`${failed} archivo(s) no se pudieron incluir en el ZIP.`);
+    } catch (e: any) {
+      setErr("No se pudo generar el ZIP: " + e.message);
+    } finally { setDownloadingZip(false); }
+  }
+
+  async function backfillPreviewFetch() {
+    setErr(null); setBackfillDone(null);
+    try {
+      const r = await fetch("/api/invoice-files/backfill-names", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ dryRun: true })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setBackfillPreview({
+        archivos: d.would_update_archivos ?? 0,
+        facturas: d.would_update_facturas ?? 0,
+        ejemplos: (d.previews ?? []).slice(0, 8).map((p: any) => ({ after: p.after, facturas: p.facturas }))
+      });
+    } catch (e: any) {
+      setErr("No se pudo calcular la vista previa: " + e.message);
+    }
+  }
+
+  async function backfillApply() {
+    setBackfillRunning(true); setErr(null);
+    try {
+      const r = await fetch("/api/invoice-files/backfill-names", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({})
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setBackfillDone({
+        archivos: d.archivos_procesados ?? 0,
+        facturas: d.facturas_actualizadas ?? 0
+      });
+      setBackfillPreview(null);
+      // Refrescar página para que los nuevos nombres aparezcan en las filas
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (e: any) {
+      setErr("No se pudo aplicar el backfill: " + e.message);
+    } finally { setBackfillRunning(false); }
+  }
+
+  // Detectar cuántos archivos históricos no tienen nombre (para mostrar el CTA)
+  const archivosSinNombre = useMemo(() => {
+    const sinNombre = new Set<string>();
+    for (const g of groups) {
+      const hasName = g.facturas.some(f => (f.original_filename ?? "").trim().length > 0);
+      if (!hasName) sinNombre.add(g.storage_path);
+    }
+    return sinNombre.size;
+  }, [groups]);
+
   const tipoLabel: Record<FileGroup["tipo"], string> = {
-    individual:    "Factura individual",
-    listado_arca:  "Listado ARCA (PDF)",
-    csv_arca:      "Excel/CSV ARCA",
+    individual:    "Individual",
+    listado_arca:  "Listado ARCA",
+    csv_arca:      "Excel/CSV",
     otro:          "Otro"
   };
 
@@ -1391,24 +1660,37 @@ function InvoiceFilesModal({
     otro:         "default"
   };
 
+  function reviewerName(id: string) {
+    const r = reviewerById.get(id);
+    return r?.full_name || r?.email || "Un usuario";
+  }
+
   return (
     <>
       <div className="modal-back" style={{ zIndex: 60 }} onClick={onClose}/>
-      <div className="fixed inset-4 md:inset-10 card soft fade-in overflow-hidden flex flex-col" style={{ zIndex: 70 }}>
-        <div className="px-6 py-5 border-b border-line flex items-start justify-between gap-4">
-          <div>
-            <div className="text-[12px] uppercase tracking-wider text-ink-3">Base de datos de archivos</div>
-            <div className="sf-display text-[22px] font-semibold mt-1">Archivos originales analizados por IA</div>
+      <div className="fixed inset-4 md:inset-8 card soft fade-in overflow-hidden flex flex-col" style={{ zIndex: 70 }}>
+        <div className="px-6 py-4 border-b border-line flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="text-[12px] uppercase tracking-wider text-ink-3">Base de datos de archivos originales</div>
+            <div className="sf-display text-[20px] font-semibold mt-1">Auditoría contable de archivos</div>
             <div className="text-[12px] text-ink-3 mt-1 max-w-2xl">
-              Todos los PDF, Excel y CSV que la IA usó para generar el libro de IVA.
-              Cada archivo puede contener una o varias facturas — hacé clic en <b>Ver</b> para abrir el original y hacer el control manual contra los datos cargados.
+              Cada archivo (PDF, Excel o CSV) que la IA procesó. Revisá, marcá como controlado, dejá notas y exportá el papel de trabajo.
             </div>
           </div>
-          <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}><Icon.Close/></button>
+          <div className="flex items-center gap-2 shrink-0">
+            <button className="btn btn-ghost" onClick={exportExcel} title="Exportar índice a Excel">
+              <Icon.Download/> Exportar índice
+            </button>
+            <button className="btn btn-ghost" onClick={downloadZip} disabled={downloadingZip}
+                    title={selected.size ? `Descargar ${selected.size} archivos seleccionados` : "Descargar todos los archivos filtrados"}>
+              <Icon.Download/> {downloadingZip ? "Generando ZIP…" : selected.size ? `Descargar ${selected.size} (ZIP)` : "Descargar todos (ZIP)"}
+            </button>
+            <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}><Icon.Close/></button>
+          </div>
         </div>
 
-        {/* Filtros */}
-        <div className="px-6 py-4 border-b border-line flex flex-wrap items-center gap-3">
+        {/* Filtros fila 1: ámbito + tipo + búsqueda */}
+        <div className="px-6 py-3 border-b border-line flex flex-wrap items-center gap-3">
           <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
             <div className={`tab ${scope==="periodo"?"active":""}`} onClick={()=>setScope("periodo")}>
               {contextLabel}
@@ -1422,7 +1704,7 @@ function InvoiceFilesModal({
             {[
               { k: "todos", t: "Todos", c: counts.todos },
               { k: "individual", t: "Individuales", c: counts.individual },
-              { k: "listado_arca", t: "Listados ARCA", c: counts.listado_arca },
+              { k: "listado_arca", t: "Listados", c: counts.listado_arca },
               { k: "csv_arca", t: "Excel/CSV", c: counts.csv_arca }
             ].map(o => (
               <div key={o.k}
@@ -1440,24 +1722,120 @@ function InvoiceFilesModal({
           </div>
         </div>
 
+        {/* Filtros fila 2: estado revisión + orden */}
+        <div className="px-6 py-3 border-b border-line flex flex-wrap items-center gap-3" style={{ background: "#fafafa" }}>
+          <div className="text-[11px] uppercase tracking-wider text-ink-3">Estado</div>
+          <div className="flex gap-1 p-1 rounded-xl bg-white">
+            {[
+              { k: "todos", t: "Todos", c: counts.todos },
+              { k: "sin_revisar", t: "Sin revisar", c: counts.sin_revisar },
+              { k: "ok", t: "OK", c: counts.revisados_ok },
+              { k: "observaciones", t: "Con observaciones", c: counts.con_obs }
+            ].map(o => (
+              <div key={o.k}
+                   className={`tab ${estadoFiltro===o.k?"active":""}`}
+                   onClick={()=>setEstadoFiltro(o.k as any)}>
+                {o.t}<span className="ml-1 text-[10px] text-ink-3">· {o.c}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="ml-auto flex items-center gap-2">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Ordenar por</div>
+            <select className="input" style={{ padding:"4px 10px", fontSize: 12, width: 180 }}
+                    value={orderBy} onChange={e => setOrderBy(e.target.value as any)}>
+              <option value="fecha">Fecha (más reciente)</option>
+              <option value="facturas">Cantidad de facturas</option>
+              <option value="total">Total ARS</option>
+              <option value="confianza">Confianza IA (menor primero)</option>
+            </select>
+          </div>
+        </div>
+
         {err && (
           <div className="mx-6 mt-3 p-2.5 rounded-lg bg-[#fdeaef] text-[#9c2944] text-[12px]">{err}</div>
         )}
 
+        {/* Banner de backfill: aparece si hay archivos sin nombre humano */}
+        {archivosSinNombre > 0 && !backfillDone && (
+          <div className="mx-6 mt-3 rounded-xl p-3 flex items-center gap-3"
+               style={{ background: "#fcf0dd", border: "1px solid #f0d69a" }}>
+            <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0"
+                 style={{ background:"#fff", color:"#b4730e" }}>
+              <Icon.Warning/>
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-[13px] font-medium" style={{ color:"#8a5709" }}>
+                {archivosSinNombre} archivo{archivosSinNombre === 1 ? "" : "s"} sin nombre humano
+              </div>
+              <div className="text-[11px]" style={{ color:"#b4730e" }}>
+                Los archivos que cargaste antes de esta actualización aparecen con un UUID.
+                Puedo asignarles nombres útiles como "Listado ARCA Emitidos - Mar 2026.pdf".
+              </div>
+            </div>
+            {!backfillPreview ? (
+              <button className="btn btn-primary" onClick={backfillPreviewFetch}>
+                Vista previa
+              </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <button className="btn btn-ghost" onClick={() => setBackfillPreview(null)} disabled={backfillRunning}>
+                  Cancelar
+                </button>
+                <button className="btn btn-primary" onClick={backfillApply} disabled={backfillRunning}>
+                  {backfillRunning ? "Aplicando…" : `Renombrar ${backfillPreview.archivos} archivo${backfillPreview.archivos === 1 ? "" : "s"}`}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        {backfillPreview && backfillPreview.ejemplos.length > 0 && (
+          <div className="mx-6 mt-2 rounded-xl p-3" style={{ background:"#fafafa", border:"1px solid var(--line)" }}>
+            <div className="text-[11px] uppercase tracking-wider text-ink-3 mb-2">
+              Vista previa — {backfillPreview.archivos} archivo(s) · {backfillPreview.facturas} factura(s) recibirán:
+            </div>
+            <div className="space-y-1">
+              {backfillPreview.ejemplos.map((e, i) => (
+                <div key={i} className="text-[12px] flex items-center gap-2">
+                  <span className="chip" style={{ background:"var(--accent-soft)", color:"var(--accent)", fontSize:10 }}>
+                    {e.facturas} fact.
+                  </span>
+                  <span className="font-mono">{e.after}</span>
+                </div>
+              ))}
+              {backfillPreview.archivos > backfillPreview.ejemplos.length && (
+                <div className="text-[11px] text-ink-3 mt-1">
+                  … y {backfillPreview.archivos - backfillPreview.ejemplos.length} archivo(s) más.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        {backfillDone && (
+          <div className="mx-6 mt-3 rounded-xl p-3 flex items-center gap-3"
+               style={{ background: "#e6f6ed", border: "1px solid #b6e2c8" }}>
+            <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0"
+                 style={{ background:"#fff", color:"#30a46c" }}>
+              <Icon.Check/>
+            </div>
+            <div className="text-[13px]" style={{ color:"#218358" }}>
+              Listo — se renombraron {backfillDone.archivos} archivo(s) ({backfillDone.facturas} factura(s) actualizadas).
+              Recargando la vista…
+            </div>
+          </div>
+        )}
+
         {/* KPIs */}
-        <div className="grid grid-cols-3 gap-3 px-6 py-4 border-b border-line" style={{ background: "#fafafa" }}>
-          <div className="rounded-xl p-3 bg-white">
-            <div className="text-[11px] uppercase tracking-wider text-ink-3">Archivos únicos</div>
-            <div className="sf-display text-[22px] font-semibold mt-1">{filteredGroups.length}</div>
-          </div>
-          <div className="rounded-xl p-3 bg-white">
-            <div className="text-[11px] uppercase tracking-wider text-ink-3">Facturas contenidas</div>
-            <div className="sf-display text-[22px] font-semibold mt-1">{totalFacturas}</div>
-          </div>
-          <div className="rounded-xl p-3 bg-white">
-            <div className="text-[11px] uppercase tracking-wider text-ink-3">Total ARS</div>
-            <div className="sf-display text-[22px] font-semibold mt-1">{money(filteredGroups.reduce((a, g) => a + g.total_ars, 0))}</div>
-          </div>
+        <div className="grid grid-cols-4 gap-3 px-6 py-4 border-b border-line" style={{ background: "#fafafa" }}>
+          <KpiSmall label="Archivos" value={filteredGroups.length} />
+          <KpiSmall label="Facturas contenidas" value={totalFacturas} />
+          <KpiSmall label="Total ARS" value={money(totalAmount)} />
+          <KpiSmall
+            label="Sin archivo original"
+            value={facturasSinArchivo.length}
+            tone={facturasSinArchivo.length ? "warn" : "muted"}
+            hint="Facturas cargadas a mano que no tienen PDF/Excel adjunto"
+          />
         </div>
 
         {/* Lista de archivos */}
@@ -1474,69 +1852,349 @@ function InvoiceFilesModal({
             <table className="clean">
               <thead>
                 <tr>
+                  <th style={{ width: 40 }}>
+                    <input type="checkbox"
+                           checked={selected.size === filteredGroups.length && filteredGroups.length > 0}
+                           onChange={toggleAll}
+                           title="Seleccionar todos"/>
+                  </th>
                   <th>Archivo</th>
                   <th>Tipo</th>
-                  <th>Período que cubre</th>
+                  <th>Período</th>
                   <th className="text-right">Facturas</th>
                   <th className="text-right">Total ARS</th>
-                  <th></th>
+                  <th>Estado</th>
+                  <th className="text-right">Acciones</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredGroups.map(g => (
-                  <tr key={g.storage_path}>
-                    <td>
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
-                             style={{
-                               background:
-                                 g.tipo === "csv_arca" ? "#e6f6ed" :
-                                 g.tipo === "listado_arca" ? "#efeaff" : "var(--accent-soft)",
-                               color:
-                                 g.tipo === "csv_arca" ? "#30a46c" :
-                                 g.tipo === "listado_arca" ? "#7c5cff" : "var(--accent)"
-                             }}>
-                          <Icon.File/>
-                        </div>
-                        <div className="min-w-0">
-                          <div className="font-medium truncate" style={{ maxWidth: 360 }} title={g.filename}>
-                            {g.filename}
+                {filteredGroups.map(g => {
+                  const review = reviewByPath.get(g.storage_path);
+                  const isExpanded = expanded === g.storage_path;
+                  const isSelected = selected.has(g.storage_path);
+                  const lowConfidence = g.ai_confidence_min < 0.85;
+
+                  return (
+                    <React.Fragment key={g.storage_path}>
+                      <tr style={isSelected ? { background: "var(--accent-soft)" } : undefined}>
+                        <td>
+                          <input type="checkbox" checked={isSelected} onChange={() => toggleSelect(g.storage_path)}/>
+                        </td>
+                        <td>
+                          <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
+                                 style={{
+                                   background:
+                                     g.tipo === "csv_arca" ? "#e6f6ed" :
+                                     g.tipo === "listado_arca" ? "#efeaff" : "var(--accent-soft)",
+                                   color:
+                                     g.tipo === "csv_arca" ? "#30a46c" :
+                                     g.tipo === "listado_arca" ? "#7c5cff" : "var(--accent)"
+                                 }}>
+                              <Icon.File/>
+                            </div>
+                            <div className="min-w-0">
+                              <div className="font-medium truncate" style={{ maxWidth: 320 }} title={g.filename}>
+                                {g.filename}
+                              </div>
+                              <div className="text-[11px] text-ink-3 flex items-center gap-2">
+                                {g.fecha_carga && <span>Cargado {String(g.fecha_carga).slice(0, 10)}</span>}
+                                {lowConfidence && (
+                                  <span className="chip" style={{ background:"#fcf0dd", color:"#b4730e", fontSize:10, padding:"1px 6px" }}>
+                                    Confianza IA {(g.ai_confidence_min * 100).toFixed(0)}%
+                                  </span>
+                                )}
+                              </div>
+                            </div>
                           </div>
-                          <div className="text-[11px] text-ink-3 font-mono truncate" style={{ maxWidth: 360 }} title={g.storage_path}>
-                            {g.storage_path}
+                        </td>
+                        <td>
+                          <Badge tone={tipoBadgeTone[g.tipo]}>{tipoLabel[g.tipo]}</Badge>
+                        </td>
+                        <td className="text-ink-2 text-[12px]">
+                          {g.fecha_primera_factura === g.fecha_ultima_factura
+                            ? g.fecha_primera_factura ?? "—"
+                            : `${g.fecha_primera_factura ?? "?"} → ${g.fecha_ultima_factura ?? "?"}`}
+                        </td>
+                        <td className="text-right">
+                          <button
+                            className="chip"
+                            style={{ background:"var(--accent-soft)", color:"var(--accent)", cursor:"pointer", border:"none" }}
+                            onClick={() => setExpanded(isExpanded ? null : g.storage_path)}
+                            title={isExpanded ? "Contraer" : "Ver facturas"}>
+                            {g.facturas.length} {isExpanded ? "▲" : "▼"}
+                          </button>
+                        </td>
+                        <td className="text-right font-semibold">{money(g.total_ars)}</td>
+                        <td>
+                          {review ? (
+                            <div className="flex flex-col" style={{ lineHeight: 1.15 }}>
+                              <Badge tone={review.status === "ok" ? "success" : review.status === "con_observacion" ? "warning" : "danger"}>
+                                {review.status === "ok" ? "✓ Revisado" : review.status === "con_observacion" ? "Obs." : "Con error"}
+                              </Badge>
+                              <span className="text-[10px] text-ink-3 mt-0.5">
+                                {reviewerName(review.reviewed_by)} · {review.reviewed_at.slice(0, 10)}
+                              </span>
+                            </div>
+                          ) : (
+                            <Badge tone="pendiente">Sin revisar</Badge>
+                          )}
+                        </td>
+                        <td className="text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            <button
+                              className="btn btn-ghost"
+                              style={{ padding:"6px 10px", fontSize: 12 }}
+                              onClick={() => openPreview(g)}
+                              disabled={loadingId === g.storage_path}
+                              title="Ver archivo"
+                            >
+                              {loadingId === g.storage_path ? "…" : "Ver"}
+                            </button>
+                            <button
+                              className="btn btn-ghost"
+                              style={{ padding:"6px 10px", fontSize: 12 }}
+                              onClick={() => openPreview(g, true)}
+                              title="Descargar original"
+                            >
+                              <Icon.Download/>
+                            </button>
+                            <button
+                              className="btn btn-primary"
+                              style={{ padding:"6px 10px", fontSize: 12 }}
+                              onClick={() => setReviewEditing(g.storage_path)}
+                              title="Marcar como revisado / dejar nota"
+                            >
+                              {review ? "Editar revisión" : "Revisar"}
+                            </button>
+                            {review && (
+                              <button
+                                className="btn btn-ghost"
+                                style={{ padding:"6px 8px", fontSize: 12, color:"#f04f6f" }}
+                                onClick={() => unreview(g.storage_path)}
+                                title="Quitar marca de revisado"
+                              >
+                                <Icon.Close/>
+                              </button>
+                            )}
                           </div>
-                        </div>
-                      </div>
-                    </td>
-                    <td>
-                      <Badge tone={tipoBadgeTone[g.tipo]}>{tipoLabel[g.tipo]}</Badge>
-                    </td>
-                    <td className="text-ink-2 text-[12px]">
-                      {g.fecha_primera_factura === g.fecha_ultima_factura
-                        ? g.fecha_primera_factura ?? "—"
-                        : `${g.fecha_primera_factura ?? "?"} → ${g.fecha_ultima_factura ?? "?"}`}
-                    </td>
-                    <td className="text-right">
-                      <span className="chip" style={{ background:"var(--accent-soft)", color:"var(--accent)" }}>
-                        {g.facturas.length}
-                      </span>
-                    </td>
-                    <td className="text-right font-semibold">{money(g.total_ars)}</td>
-                    <td className="text-right">
-                      <button
-                        className="btn btn-primary"
-                        style={{ padding:"6px 12px", fontSize: 12 }}
-                        onClick={() => openFile(g)}
-                        disabled={loadingId === g.storage_path}
-                      >
-                        {loadingId === g.storage_path ? "Abriendo…" : <><Icon.Link/> Ver</>}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                        </td>
+                      </tr>
+
+                      {/* Fila expandible: nota + lista de facturas */}
+                      {isExpanded && (
+                        <tr>
+                          <td colSpan={8} style={{ background: "#fafafa", padding: 0 }}>
+                            <div className="p-4 space-y-3">
+                              {review?.note && (
+                                <div className="rounded-xl p-3" style={{ background: "#fff", border: "1px solid var(--line)" }}>
+                                  <div className="text-[11px] uppercase tracking-wider text-ink-3 mb-1">
+                                    Nota del contador — {reviewerName(review.reviewed_by)}
+                                  </div>
+                                  <div className="text-[13px] text-ink-1 whitespace-pre-wrap">{review.note}</div>
+                                </div>
+                              )}
+                              <div className="text-[11px] uppercase tracking-wider text-ink-3">
+                                Facturas contenidas en este archivo ({g.facturas.length})
+                              </div>
+                              <div className="rounded-xl overflow-hidden" style={{ background: "#fff", border: "1px solid var(--line)" }}>
+                                <table className="clean">
+                                  <thead>
+                                    <tr>
+                                      <th style={{ background: "#fff" }}>Fecha</th>
+                                      <th style={{ background: "#fff" }}>Comprobante</th>
+                                      <th style={{ background: "#fff" }}>Razón social</th>
+                                      <th style={{ background: "#fff" }}>CUIT</th>
+                                      <th style={{ background: "#fff" }}>Tipo</th>
+                                      <th style={{ background: "#fff" }} className="text-right">Total</th>
+                                      <th style={{ background: "#fff" }}></th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {g.facturas
+                                      .slice()
+                                      .sort((a, b) => (b.fecha ?? "").localeCompare(a.fecha ?? ""))
+                                      .map(f => (
+                                        <tr key={f.id}>
+                                          <td className="text-ink-2">{f.fecha}</td>
+                                          <td className="text-ink-2 font-mono text-[12px]">{f.comprobante ?? "—"}</td>
+                                          <td className="font-medium truncate" style={{ maxWidth: 240 }}>{f.razon_social}</td>
+                                          <td className="text-ink-2 font-mono text-[12px]">{f.cuit ?? "—"}</td>
+                                          <td>
+                                            <Badge tone={f.tipo === "venta" ? "venta" : "compra"}>
+                                              {f.tipo === "venta" ? "Venta" : "Compra"}
+                                            </Badge>
+                                          </td>
+                                          <td className="text-right font-semibold">{money(Number(f.total ?? 0))}</td>
+                                          <td className="text-right">
+                                            <button className="btn btn-ghost"
+                                                    style={{ padding:"4px 8px", fontSize: 11 }}
+                                                    onClick={() => onOpenInvoice(f)}>
+                                              Abrir
+                                            </button>
+                                          </td>
+                                        </tr>
+                                      ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
               </tbody>
             </table>
           )}
+        </div>
+      </div>
+
+      {/* Panel de preview embebido */}
+      {preview && (
+        <>
+          <div className="modal-back" style={{ zIndex: 80 }} onClick={() => setPreview(null)}/>
+          <div className="fixed inset-4 md:inset-16 card soft fade-in overflow-hidden flex flex-col" style={{ zIndex: 90 }}>
+            <div className="px-4 py-3 border-b border-line flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <div className="text-[11px] uppercase tracking-wider text-ink-3">Vista previa</div>
+                <div className="sf-display text-[15px] font-semibold truncate">{preview.filename}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <a className="btn btn-ghost" href={preview.url} target="_blank" rel="noreferrer">
+                  <Icon.Link/> Abrir en pestaña
+                </a>
+                <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={() => setPreview(null)}>
+                  <Icon.Close/>
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-hidden" style={{ background: "#525659" }}>
+              {preview.kind === "pdf" ? (
+                <iframe src={preview.url} className="w-full h-full" style={{ border: 0 }} title="Preview PDF"/>
+              ) : preview.kind === "image" ? (
+                <div className="w-full h-full flex items-center justify-center overflow-auto">
+                  <img src={preview.url} alt={preview.filename} style={{ maxWidth: "100%", maxHeight: "100%" }}/>
+                </div>
+              ) : (
+                <div className="w-full h-full flex items-center justify-center text-white text-[13px]">
+                  Este formato no se puede previsualizar en el navegador.
+                </div>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Modal de revisión */}
+      {reviewEditing && (
+        <ReviewEditor
+          path={reviewEditing}
+          current={reviewByPath.get(reviewEditing) ?? null}
+          filename={groups.find(g => g.storage_path === reviewEditing)?.filename ?? "Archivo"}
+          onClose={() => setReviewEditing(null)}
+          onSave={saveReview}
+        />
+      )}
+    </>
+  );
+}
+
+function KpiSmall({ label, value, hint, tone = "default" }: {
+  label: string; value: string | number; hint?: string; tone?: "default" | "warn" | "muted";
+}) {
+  const color = tone === "warn" ? "#b4730e" : tone === "muted" ? "#6e6e73" : undefined;
+  return (
+    <div className="rounded-xl p-3 bg-white">
+      <div className="text-[11px] uppercase tracking-wider text-ink-3">{label}</div>
+      <div className="sf-display text-[22px] font-semibold mt-1" style={color ? { color } : undefined}>{value}</div>
+      {hint && <div className="text-[10px] text-ink-3 mt-1">{hint}</div>}
+    </div>
+  );
+}
+
+function ReviewEditor({
+  path, current, filename, onClose, onSave
+}: {
+  path: string;
+  current: FileReview | null;
+  filename: string;
+  onClose: () => void;
+  onSave: (path: string, status: FileReview["status"], note: string) => Promise<void>;
+}) {
+  const [status, setStatus] = useState<FileReview["status"]>(current?.status ?? "ok");
+  const [note, setNote] = useState(current?.note ?? "");
+  const [saving, setSaving] = useState(false);
+
+  async function submit() {
+    setSaving(true);
+    try { await onSave(path, status, note); }
+    finally { setSaving(false); }
+  }
+
+  return (
+    <>
+      <div className="modal-back" style={{ zIndex: 85 }} onClick={onClose}/>
+      <div className="fixed right-6 top-6 bottom-6 w-[460px] card soft p-6 fade-in overflow-y-auto scroll-clean" style={{ zIndex: 95 }}>
+        <div className="flex items-start justify-between mb-3">
+          <div>
+            <div className="text-[12px] uppercase tracking-wider text-ink-3">Revisión contable</div>
+            <div className="sf-display text-[18px] font-semibold mt-1 truncate" title={filename}>{filename}</div>
+            <div className="text-[11px] text-ink-3 mt-0.5">Marcá el resultado del control y dejá una nota si hace falta.</div>
+          </div>
+          <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}><Icon.Close/></button>
+        </div>
+
+        <div className="space-y-3 mt-4">
+          <div>
+            <div className="text-[11px] font-medium text-ink-2 mb-2">Resultado del control</div>
+            <div className="space-y-2">
+              {[
+                { k: "ok",              label: "Revisado — todo OK",           desc: "Los datos coinciden con el archivo original",             tone: "#30a46c", bg: "#e6f6ed" },
+                { k: "con_observacion", label: "Con observaciones",            desc: "Requiere aclaración o hay diferencias menores",           tone: "#b4730e", bg: "#fcf0dd" },
+                { k: "con_error",       label: "Con error — necesita corregir", desc: "Hay diferencias que hay que corregir en el libro",       tone: "#c02648", bg: "#fdeaef" }
+              ].map(o => (
+                <label key={o.k}
+                       className="flex items-start gap-3 p-3 rounded-xl cursor-pointer"
+                       style={{
+                         border: `1.5px solid ${status === o.k ? o.tone : "var(--line)"}`,
+                         background: status === o.k ? o.bg : "#fff"
+                       }}>
+                  <input type="radio" name="status" checked={status === o.k}
+                         onChange={() => setStatus(o.k as any)} style={{ marginTop: 3 }}/>
+                  <div>
+                    <div className="text-[13px] font-medium" style={{ color: status === o.k ? o.tone : undefined }}>
+                      {o.label}
+                    </div>
+                    <div className="text-[11px] text-ink-3">{o.desc}</div>
+                  </div>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[11px] font-medium text-ink-2 mb-1">Nota (opcional)</div>
+            <textarea className="input"
+                      style={{ minHeight: 100, resize: "vertical" }}
+                      placeholder="Ej: Falta incluir la nota de crédito 0001-00042. Confirmé el CAE con AFIP."
+                      value={note} onChange={e => setNote(e.target.value)}/>
+          </div>
+
+          {current && (
+            <div className="text-[11px] text-ink-3">
+              Revisado por última vez el {current.reviewed_at.slice(0, 10)}.
+              Al guardar quedás vos como último revisor.
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
+            <button className="btn btn-primary" onClick={submit} disabled={saving}>
+              {saving ? "Guardando…" : (current ? "Actualizar revisión" : "Marcar como revisado")}
+            </button>
+          </div>
         </div>
       </div>
     </>

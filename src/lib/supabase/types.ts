@@ -77,6 +77,7 @@ export interface Invoice {
   total: number;
   cae: string | null;
   storage_path: string | null;
+  original_filename?: string | null;
   moneda?: "ARS" | "USD" | "EUR" | "OTRA" | null;
   tipo_cambio?: number | null;
   total_moneda_original?: number | null;

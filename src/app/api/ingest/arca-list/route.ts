@@ -144,6 +144,7 @@ export async function POST(req: NextRequest) {
       total,
       cae: f.cae ?? null,
       storage_path: storagePath,
+      original_filename: file.name,
       moneda,
       tipo_cambio,
       total_moneda_original: moneda !== "ARS" ? totalOrig : null,

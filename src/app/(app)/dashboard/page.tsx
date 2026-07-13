@@ -9,15 +9,28 @@ export default async function DashboardPage() {
   let invoices: any[] = [];
   let annual: { m: string; debito: number; credito: number }[] = [];
   let company: any = null;
+  let fileReviews: any[] = [];
+  let reviewers: any[] = [];
 
   if (companyId) {
     const admin = createAdminClient();
-    const [inv, comp] = await Promise.all([
-      admin.from("invoices").select("*").eq("company_id", companyId).order("fecha", { ascending: false }).limit(200),
-      admin.from("companies").select("*").eq("id", companyId).maybeSingle()
+    const [inv, comp, fr] = await Promise.all([
+      // Sin límite: necesitamos histórico completo para el índice de archivos originales.
+      admin.from("invoices").select("*").eq("company_id", companyId).order("fecha", { ascending: false }).limit(10000),
+      admin.from("companies").select("*").eq("id", companyId).maybeSingle(),
+      admin.from("file_reviews").select("*").eq("company_id", companyId)
     ]);
     invoices = inv.data ?? [];
     company = comp.data ?? null;
+    fileReviews = fr.data ?? [];
+
+    // Traer nombres de los revisores para mostrarlos
+    const reviewerIds = Array.from(new Set(fileReviews.map((r: any) => r.reviewed_by)));
+    if (reviewerIds.length) {
+      const { data: users } = await admin
+        .from("profiles").select("id, email, full_name").in("id", reviewerIds);
+      reviewers = users ?? [];
+    }
 
     const year = new Date().getFullYear();
     const MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
@@ -36,6 +49,8 @@ export default async function DashboardPage() {
       invoices={invoices}
       annual={annual}
       company={company}
+      fileReviews={fileReviews}
+      reviewers={reviewers}
     />
   );
 }

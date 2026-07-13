@@ -36,6 +36,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "No se pudo leer el archivo: " + e.message }, { status: 400 });
   }
 
+  // Guardamos el archivo original en Storage para auditoría del contador.
+  // Todas las facturas de este CSV/Excel compartirán este storage_path.
+  const ext = (file.name.split(".").pop() ?? "xlsx").toLowerCase();
+  const storagePath = `${companyId}/arca-csv/${new Date().toISOString().slice(0, 7)}/${crypto.randomUUID()}.${ext}`;
+  await admin.storage.from("invoices").upload(storagePath, bytes, {
+    contentType: file.type || "application/octet-stream"
+  });
+
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json<any>(sheet, { defval: null, raw: false });
   if (!rows.length) return NextResponse.json({ error: "Archivo vacío" }, { status: 400 });
@@ -141,7 +149,8 @@ export async function POST(req: NextRequest) {
         percepciones: otros,
         total,
         cae: row[colCae!] ? String(row[colCae!]).trim() : null,
-        storage_path: null,
+        storage_path: storagePath,
+        original_filename: file.name,
         moneda,
         tipo_cambio,
         total_moneda_original: moneda !== "ARS" ? totalOrig : null,

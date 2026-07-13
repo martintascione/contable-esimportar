@@ -91,6 +91,7 @@ export async function POST(req: NextRequest) {
       })(),
       cae: data.cae,
       storage_path: storagePath,
+      original_filename: file.name,
       ai_metadata: data as any,
       ai_confidence: data.confidence ?? null,
       status: (data.confidence ?? 0) >= 0.85 ? "aprobada" : "revision",
