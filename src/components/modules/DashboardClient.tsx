@@ -9,6 +9,7 @@ import { AnnualChart } from "@/components/ui/AnnualChart";
 import { Icon } from "@/components/ui/Icons";
 import { MobileHero } from "@/components/ui/MobileHero";
 import { money, periodoMesLabel } from "@/lib/format";
+import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
 import type { Invoice, Company } from "@/lib/supabase/types";
 
 type FileReview = {
@@ -1388,6 +1389,9 @@ function InvoiceFilesModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, preview, reviewEditing]);
 
+  // Bloquear scroll del body mientras el modal está abierto (evita scroll chaining)
+  useLockBodyScroll();
+
   const reviewByPath = useMemo(() => {
     const m = new Map<string, FileReview>();
     for (const r of reviews) m.set(r.storage_path, r);
@@ -1681,10 +1685,25 @@ function InvoiceFilesModal({
             <button className="btn btn-ghost" onClick={exportExcel} title="Exportar índice a Excel">
               <Icon.Download/> Exportar índice
             </button>
-            <button className="btn btn-ghost" onClick={downloadZip} disabled={downloadingZip}
-                    title={selected.size ? `Descargar ${selected.size} archivos seleccionados` : "Descargar todos los archivos filtrados"}>
-              <Icon.Download/> {downloadingZip ? "Generando ZIP…" : selected.size ? `Descargar ${selected.size} (ZIP)` : "Descargar todos (ZIP)"}
-            </button>
+            {(() => {
+              const zipCount = selected.size || filteredGroups.length;
+              const overLimit = zipCount > 200;
+              return (
+                <button className="btn btn-ghost" onClick={downloadZip}
+                        disabled={downloadingZip || zipCount === 0}
+                        title={overLimit
+                          ? `Sólo se pueden descargar 200 archivos por ZIP (tenés ${zipCount}). Ajustá los filtros.`
+                          : selected.size ? `Descargar ${selected.size} seleccionados` : `Descargar ${zipCount} archivos filtrados`}>
+                  <Icon.Download/> {
+                    downloadingZip ? "Generando ZIP…"
+                    : zipCount === 0 ? "ZIP (sin archivos)"
+                    : overLimit ? `ZIP máx. 200 (tenés ${zipCount})`
+                    : selected.size ? `Descargar ${selected.size} (ZIP)`
+                    : `Descargar todos (${zipCount})`
+                  }
+                </button>
+              );
+            })()}
             <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}><Icon.Close/></button>
           </div>
         </div>
@@ -1839,7 +1858,7 @@ function InvoiceFilesModal({
         </div>
 
         {/* Lista de archivos */}
-        <div className="flex-1 overflow-y-auto scroll-clean">
+        <div className="flex-1 overflow-y-auto scroll-clean" style={{ overscrollBehavior: "contain" }}>
           {filteredGroups.length === 0 ? (
             <div className="p-16 text-center text-ink-3">
               <div className="w-14 h-14 mx-auto rounded-2xl flex items-center justify-center bg-brand-soft text-brand mb-3">
@@ -1854,9 +1873,10 @@ function InvoiceFilesModal({
                 <tr>
                   <th style={{ width: 40 }}>
                     <input type="checkbox"
-                           checked={selected.size === filteredGroups.length && filteredGroups.length > 0}
+                           checked={filteredGroups.length > 0 && selected.size === filteredGroups.length}
+                           disabled={filteredGroups.length === 0}
                            onChange={toggleAll}
-                           title="Seleccionar todos"/>
+                           title="Seleccionar/deseleccionar todos"/>
                   </th>
                   <th>Archivo</th>
                   <th>Tipo</th>
@@ -2136,7 +2156,7 @@ function ReviewEditor({
   return (
     <>
       <div className="modal-back" style={{ zIndex: 85 }} onClick={onClose}/>
-      <div className="fixed right-6 top-6 bottom-6 w-[460px] card soft p-6 fade-in overflow-y-auto scroll-clean" style={{ zIndex: 95 }}>
+      <div className="fixed right-6 top-6 bottom-6 w-[460px] card soft p-6 fade-in overflow-y-auto scroll-clean" style={{ zIndex: 95, overscrollBehavior: "contain" }}>
         <div className="flex items-start justify-between mb-3">
           <div>
             <div className="text-[12px] uppercase tracking-wider text-ink-3">Revisión contable</div>

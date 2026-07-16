@@ -10,10 +10,12 @@ export default async function BankPage() {
   let invoices: any[] = [];
   let statements: any[] = [];
   let partners: any[] = [];
+  let fileReviews: any[] = [];
+  let reviewers: any[] = [];
 
   if (companyId) {
     const admin = createAdminClient();
-    const [mov, inv, st, pt] = await Promise.all([
+    const [mov, inv, st, pt, fr] = await Promise.all([
       admin.from("bank_movements")
         .select("*, bank_statements(id, banco, cuenta, cbu, periodo_desde, periodo_hasta)")
         .eq("company_id", companyId)
@@ -24,13 +26,17 @@ export default async function BankPage() {
         .eq("company_id", companyId)
         .limit(1000),
       admin.from("bank_statements")
-        .select("id, banco, cuenta, cbu, periodo_desde, periodo_hasta, created_at")
+        .select("id, banco, cuenta, cbu, periodo_desde, periodo_hasta, storage_path, original_filename, moneda, created_at")
         .eq("company_id", companyId)
         .order("created_at", { ascending: false }),
       admin.from("company_partners")
         .select("*")
         .eq("company_id", companyId)
-        .order("created_at", { ascending: true })
+        .order("created_at", { ascending: true }),
+      admin.from("file_reviews")
+        .select("*")
+        .eq("company_id", companyId)
+        .eq("entity_type", "bank_statement")
     ]);
     movements = (mov.data ?? []).map((m: any) => ({
       ...m,
@@ -44,7 +50,24 @@ export default async function BankPage() {
     invoices = inv.data ?? [];
     statements = st.data ?? [];
     partners = pt.data ?? [];
+    fileReviews = fr.data ?? [];
+
+    const reviewerIds = Array.from(new Set(fileReviews.map((r: any) => r.reviewed_by)));
+    if (reviewerIds.length) {
+      const { data: users } = await admin
+        .from("profiles").select("id, email, full_name").in("id", reviewerIds);
+      reviewers = users ?? [];
+    }
   }
 
-  return <BankClient movements={movements} invoices={invoices} statements={statements} partners={partners} />;
+  return (
+    <BankClient
+      movements={movements}
+      invoices={invoices}
+      statements={statements}
+      partners={partners}
+      fileReviews={fileReviews}
+      reviewers={reviewers}
+    />
+  );
 }

@@ -1,12 +1,13 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Topbar } from "@/components/ui/Topbar";
 import { Kpi } from "@/components/ui/Kpi";
 import { Badge } from "@/components/ui/Badge";
 import { Icon } from "@/components/ui/Icons";
 import { money } from "@/lib/format";
+import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
 import { createClient } from "@/lib/supabase/client";
 import type { BankMovement, Invoice } from "@/lib/supabase/types";
 
@@ -27,6 +28,8 @@ type Statement = {
   cbu: string | null;
   periodo_desde: string | null;
   periodo_hasta: string | null;
+  storage_path?: string | null;
+  original_filename?: string | null;
   created_at: string;
 };
 type Partner = {
@@ -38,11 +41,24 @@ type Partner = {
   porcentaje: number | null;
   observaciones: string | null;
 };
+type BankFileReview = {
+  id: string;
+  company_id: string;
+  storage_path: string;
+  entity_type: string;
+  reviewed_by: string;
+  reviewed_at: string;
+  note: string | null;
+  status: "ok" | "con_observacion" | "con_error";
+};
+type Reviewer = { id: string; email: string | null; full_name: string | null };
 type Props = {
   movements: MovementEnriched[];
   invoices: Pick<Invoice, "id" | "comprobante" | "razon_social" | "cuit" | "fecha" | "tipo" | "total">[];
   statements: Statement[];
   partners?: Partner[];
+  fileReviews?: BankFileReview[];
+  reviewers?: Reviewer[];
 };
 
 const MESES_ABREV = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
@@ -59,12 +75,15 @@ function ymLabel(ym: string) {
   return `${MESES_ABREV[Number(m) - 1] ?? ""} ${y}`;
 }
 
-export function BankClient({ movements: initial, invoices, statements, partners: initialPartners = [] }: Props) {
+export function BankClient({ movements: initial, invoices, statements, partners: initialPartners = [], fileReviews: initialReviews = [], reviewers = [] }: Props) {
   const router = useRouter();
   const [movements, setMovements] = useState<MovementEnriched[]>(initial);
+  const [fileReviews, setFileReviews] = useState<BankFileReview[]>(initialReviews);
+  const [showFilesModal, setShowFilesModal] = useState(false);
   const [banco, setBanco] = useState<string>("__todos__");
   const [periodo, setPeriodo] = useState<string>("__todos__"); // "__todos__" | "YYYY-MM"
   const [tipoParte, setTipoParte] = useState<"todos" | "propia" | "tercero" | "socios" | "sin_cuit">("todos");
+  const [monedaFiltro, setMonedaFiltro] = useState<"todas" | "ARS" | "USD" | "EUR">("todas");
   const [q, setQ] = useState("");
   const [modal, setModal] = useState<MovementEnriched | null>(null);
   const [reclassifying, setReclassifying] = useState(false);
@@ -156,6 +175,10 @@ export function BankClient({ movements: initial, invoices, statements, partners:
     if (tipoParte === "tercero")  rows = rows.filter(m => m.cuit_contraparte && !m.es_cuenta_propia && !isPartnerMovement(m));
     if (tipoParte === "socios")   rows = rows.filter(m => isPartnerMovement(m) !== null);
     if (tipoParte === "sin_cuit") rows = rows.filter(m => !m.cuit_contraparte);
+    // Filtro por moneda: importante porque los montos no son homogéneos
+    if (monedaFiltro !== "todas") {
+      rows = rows.filter(m => (m.moneda ?? "ARS") === monedaFiltro);
+    }
     if (q) {
       const s = q.toLowerCase();
       rows = rows.filter(m =>
@@ -170,15 +193,43 @@ export function BankClient({ movements: initial, invoices, statements, partners:
       return { ...m, socio_nombre: socio.nombre, socio_relacion: socio.relacion };
     });
     return enriched.slice().sort((a, b) => a.fecha.localeCompare(b.fecha));
-  }, [movements, banco, periodoEfectivo, tipoParte, q, partnerByDoc]);
+  }, [movements, banco, periodoEfectivo, tipoParte, monedaFiltro, q, partnerByDoc]);
+
+  // Totales SEPARADOS por moneda — porque ARS y USD no se pueden sumar juntos.
+  // Devuelve un objeto por moneda con {ingresos, egresos, saldo, count}.
+  const totalesPorMoneda = useMemo(() => {
+    const map = new Map<string, { ingresos: number; egresos: number; saldo: number; count: number }>();
+    for (const m of filteredBase) {
+      const mn = (m.moneda ?? "ARS") as string;
+      if (!map.has(mn)) map.set(mn, { ingresos: 0, egresos: 0, saldo: 0, count: 0 });
+      const agg = map.get(mn)!;
+      const monto = Number(m.monto);
+      if (m.tipo === "ingreso") agg.ingresos += monto;
+      else agg.egresos += monto;
+      agg.saldo = agg.ingresos - agg.egresos;
+      agg.count++;
+    }
+    return map;
+  }, [filteredBase]);
 
   const totales = useMemo(() => {
-    const ingresos = filteredBase.filter(m => m.tipo === "ingreso").reduce((a, b) => a + Number(b.monto), 0);
-    const egresos = filteredBase.filter(m => m.tipo === "egreso").reduce((a, b) => a + Number(b.monto), 0);
     const conc = filteredBase.filter(m => m.estado === "conciliado").length;
     const pend = filteredBase.filter(m => m.estado === "pendiente").length;
-    return { ingresos, egresos, saldo: ingresos - egresos, conc, pend, total: filteredBase.length };
-  }, [filteredBase]);
+    // Cuando hay una sola moneda en la vista, exponemos los totales "planos"
+    // para que la UI vieja siga funcionando.
+    const monedas = Array.from(totalesPorMoneda.keys());
+    const monedaUnica = monedas.length === 1 ? monedas[0] : null;
+    const primero = monedaUnica ? totalesPorMoneda.get(monedaUnica)! : { ingresos: 0, egresos: 0, saldo: 0, count: 0 };
+    return {
+      ingresos: primero.ingresos,
+      egresos: primero.egresos,
+      saldo: primero.saldo,
+      conc,
+      pend,
+      total: filteredBase.length,
+      monedaUnica
+    };
+  }, [filteredBase, totalesPorMoneda]);
 
   // Agrupar por mes para la vista cuando "todos los meses" está seleccionado dentro de un banco
   const agrupadoPorMes = useMemo(() => {
@@ -270,35 +321,82 @@ export function BankClient({ movements: initial, invoices, statements, partners:
         {/* Dropzone de carga */}
         <BankDropzone banco={bancoParaUpload} onDone={() => router.refresh()} />
 
-        {/* KPIs aplicados al filtro actual */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-5">
-          <Kpi label="Ingresos"   value={money(totales.ingresos)} hint={`${bancoActivoLabel} · ${periodoActivoLabel}`} />
-          <Kpi label="Egresos"    value={money(totales.egresos)}  hint="Pagos, impuestos y comisiones" />
-          <Kpi label="Saldo neto" value={money(totales.saldo)}    hint="Diferencia del período" />
-          <Kpi label="Movimientos" value={`${totales.total}`} hint={`${totales.conc} conciliados · ${totales.pend} pendientes`} />
-        </div>
+        {/* KPIs — separados por moneda (ARS y USD no se pueden sumar juntos) */}
+        <KpisPorMoneda
+          totalesPorMoneda={totalesPorMoneda}
+          totalMovimientos={totales.total}
+          conciliados={totales.conc}
+          pendientes={totales.pend}
+          contextLabel={`${bancoActivoLabel} · ${periodoActivoLabel}`}
+        />
 
         {/* Filtro de contraparte + búsqueda + reclasificar */}
-        <div className="card p-3 flex flex-wrap items-center gap-3">
-          <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
-            {[
-              { k: "todos",    t: "Todas" },
-              { k: "tercero",  t: "Terceros" },
-              { k: "propia",   t: "Cuenta propia" },
-              { k: "socios",   t: `Socios${partners.length > 0 ? ` (${partners.length})` : ""}` },
-              { k: "sin_cuit", t: "Sin CUIT" }
-            ].map(o => (
-              <div key={o.k} className={`tab ${tipoParte === o.k ? "active" : ""}`}
-                   onClick={() => setTipoParte(o.k as any)}>{o.t}</div>
-            ))}
+        <div className="card p-3 space-y-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
+              {[
+                { k: "todos",    t: "Todas" },
+                { k: "tercero",  t: "Terceros" },
+                { k: "propia",   t: "Cuenta propia" },
+                { k: "socios",   t: `Socios${partners.length > 0 ? ` (${partners.length})` : ""}` },
+                { k: "sin_cuit", t: "Sin CUIT" }
+              ].map(o => (
+                <div key={o.k} className={`tab ${tipoParte === o.k ? "active" : ""}`}
+                     onClick={() => setTipoParte(o.k as any)}>{o.t}</div>
+              ))}
+            </div>
+            {/* Filtro por moneda — sólo aparece si hay al menos un mov no-ARS en la vista */}
+            {(() => {
+              const monedasEnMovs = new Set(movements.map(m => (m.moneda ?? "ARS") as string));
+              if (monedasEnMovs.size <= 1) return null;
+              const opts = [{ k: "todas", t: "Todas monedas" }] as { k: string; t: string }[];
+              if (monedasEnMovs.has("ARS")) opts.push({ k: "ARS", t: "ARS $" });
+              if (monedasEnMovs.has("USD")) opts.push({ k: "USD", t: "USD u$s" });
+              if (monedasEnMovs.has("EUR")) opts.push({ k: "EUR", t: "EUR €" });
+              return (
+                <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
+                  {opts.map(o => (
+                    <div key={o.k} className={`tab ${monedaFiltro === o.k ? "active" : ""}`}
+                         onClick={() => setMonedaFiltro(o.k as any)}>{o.t}</div>
+                  ))}
+                </div>
+              );
+            })()}
+            <div className="flex-1 relative min-w-[240px]">
+              <div className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3"><Icon.Search /></div>
+              <input className="input pl-9" placeholder="Buscar por descripción, contraparte, CUIT…" value={q} onChange={e => setQ(e.target.value)} />
+            </div>
+            <button className="btn btn-ghost" onClick={reclassify} disabled={reclassifying}>
+              <Icon.Sparkles/> {reclassifying ? "Reclasificando…" : "Reclasificar CUITs"}
+            </button>
           </div>
-          <div className="flex-1 relative min-w-[240px]">
-            <div className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3"><Icon.Search /></div>
-            <input className="input pl-9" placeholder="Buscar por descripción, contraparte, CUIT…" value={q} onChange={e => setQ(e.target.value)} />
+          <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-line" style={{ paddingTop: 10 }}>
+            {(() => {
+              const conArchivo = statements.filter(s => s.storage_path).length;
+              const sinArchivo = statements.length - conArchivo;
+              return <>
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => setShowFilesModal(true)}
+                  title="Ver los extractos bancarios originales para auditoría manual"
+                >
+                  <Icon.Folder /> Extractos originales
+                  <span className="ml-1 chip" style={{ background:"var(--accent-soft)", color:"var(--accent)", fontSize:11, padding:"1px 8px" }}>
+                    {conArchivo}
+                  </span>
+                </button>
+                {sinArchivo > 0 && (
+                  <span className="chip" style={{ background:"#fcf0dd", color:"#b4730e", fontSize:11 }}
+                        title="Extractos cargados sin PDF/CSV asociado — no se pueden auditar visualmente">
+                    {sinArchivo} sin archivo
+                  </span>
+                )}
+                <div className="text-[11px] text-ink-3">
+                  Auditoría contable · revisá los PDF/CSV que la IA usó para armar los movimientos
+                </div>
+              </>;
+            })()}
           </div>
-          <button className="btn btn-ghost" onClick={reclassify} disabled={reclassifying}>
-            <Icon.Sparkles/> {reclassifying ? "Reclasificando…" : "Reclasificar CUITs"}
-          </button>
         </div>
         {reclassMsg && (
           <div className="text-[12px] px-3 text-ink-2">{reclassMsg}</div>
@@ -366,6 +464,32 @@ export function BankClient({ movements: initial, invoices, statements, partners:
         <AddPartnerModal
           onClose={() => setAddingPartner(false)}
           onCreated={(p) => { setPartners(prev => [...prev, p]); setAddingPartner(false); }}
+        />
+      )}
+
+      {showFilesModal && (
+        <BankFilesModal
+          statements={statements}
+          movements={movements}
+          currentBanco={banco === "__todos__" ? null : banco}
+          currentPeriodo={periodoEfectivo === "__todos__" ? null : periodoEfectivo}
+          contextLabel={`${bancoActivoLabel} · ${periodoActivoLabel}`}
+          reviews={fileReviews}
+          reviewers={reviewers}
+          onReviewChange={(path, review) => {
+            setFileReviews(prev => {
+              const filtered = prev.filter(r => r.storage_path !== path);
+              return review ? [...filtered, review] : filtered;
+            });
+          }}
+          onClose={() => setShowFilesModal(false)}
+          onJumpToMovements={(bancoTarget, periodoTarget) => {
+            setShowFilesModal(false);
+            setBanco(bancoTarget ?? "__todos__");
+            setPeriodo(periodoTarget ?? "__todos__");
+            // Scroll al listado
+            setTimeout(() => window.scrollTo({ top: 400, behavior: "smooth" }), 100);
+          }}
         />
       )}
 
@@ -491,7 +615,18 @@ function MovementsTable({
                 </td>
                 <td><Badge tone={m.tipo as any}>{m.tipo === "ingreso" ? "Ingreso" : "Egreso"}</Badge></td>
                 <td className="text-right font-semibold" style={{ color: m.tipo === "ingreso" ? "#30a46c" : "var(--text)" }}>
-                  {m.tipo === "ingreso" ? "+ " : "− "}{money(m.monto)}
+                  <div className="flex flex-col items-end" style={{ lineHeight: 1.2 }}>
+                    <span>
+                      {m.tipo === "ingreso" ? "+ " : "− "}
+                      {fmtMoneda(Number(m.monto), (m.moneda ?? "ARS") as string)}
+                    </span>
+                    {(m.moneda === "USD" || m.moneda === "EUR") && m.tipo_cambio_referencia && (
+                      <span className="text-[10px] text-ink-3 font-normal"
+                            title={`TC ${m.tipo_cambio_referencia_fuente === "bcra" ? "BCRA" : "manual"} del ${m.fecha}`}>
+                        TC ref. ${new Intl.NumberFormat("es-AR", { minimumFractionDigits: 2 }).format(Number(m.tipo_cambio_referencia))}
+                      </span>
+                    )}
+                  </div>
                 </td>
                 <td>
                   {m.estado === "conciliado" && <Badge tone="conciliado"><Icon.Check /> Conciliado</Badge>}
@@ -837,6 +972,7 @@ function SummaryCard({
 function AddPartnerModal({
   onClose, onCreated
 }: { onClose: () => void; onCreated: (p: Partner) => void }) {
+  useLockBodyScroll();
   const [nombre, setNombre] = useState("");
   const [cuit, setCuit] = useState("");
   const [dni, setDni] = useState("");
@@ -998,6 +1134,1208 @@ function BankDropzone({ banco, onDone }: { banco: string; onDone: () => void }) 
             <div className="ml-auto text-[13px] font-semibold text-ink-2">{progress}%</div>
           </div>
           <div className="bar"><span style={{ width: progress + "%" }} /></div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// Modal: Extractos bancarios originales (para control manual del contador)
+// ============================================================================
+
+type StFileGroup = {
+  storage_path: string;
+  statement: Statement;
+  filename: string;
+  extension: string;
+  movements: MovementEnriched[];
+  ingresos: number;
+  egresos: number;
+};
+
+function isPreviewableBank(path: string): "pdf" | "image" | "excel" | "csv" | "otro" {
+  const p = path.toLowerCase();
+  if (p.endsWith(".pdf")) return "pdf";
+  if (p.endsWith(".png") || p.endsWith(".jpg") || p.endsWith(".jpeg") || p.endsWith(".webp")) return "image";
+  if (p.endsWith(".xlsx") || p.endsWith(".xls")) return "excel";
+  if (p.endsWith(".csv")) return "csv";
+  return "otro";
+}
+
+function BankFilesModal({
+  statements, movements, currentBanco, currentPeriodo, contextLabel,
+  reviews, reviewers, onReviewChange, onClose, onJumpToMovements
+}: {
+  statements: Statement[];
+  movements: MovementEnriched[];
+  currentBanco: string | null;
+  currentPeriodo: string | null; // "YYYY-MM"
+  contextLabel: string;
+  reviews: BankFileReview[];
+  reviewers: Reviewer[];
+  onReviewChange: (path: string, review: BankFileReview | null) => void;
+  onClose: () => void;
+  onJumpToMovements: (banco: string | null, periodoYYYYMM: string | null) => void;
+}) {
+  useLockBodyScroll();
+
+  const [scope, setScope] = useState<"periodo" | "todos">("periodo");
+  const [bancoFiltro, setBancoFiltro] = useState<string>("__todos__");
+  const [q, setQ] = useState("");
+  const [estadoFiltro, setEstadoFiltro] = useState<"todos" | "sin_revisar" | "ok" | "observaciones" | "anomalias">("todos");
+  const [orderBy, setOrderBy] = useState<"fecha" | "movimientos" | "monto">("fecha");
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [preview, setPreview] = useState<{ path: string; url: string; kind: string; filename: string } | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [reviewEditing, setReviewEditing] = useState<string | null>(null);
+  const [currencyEditing, setCurrencyEditing] = useState<StFileGroup | null>(null);
+  const [loadingId, setLoadingId] = useState<string | null>(null);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [backfillPreview, setBackfillPreview] = useState<null | {
+    total: number;
+    ejemplos: { after: string }[];
+  }>(null);
+  const [backfillRunning, setBackfillRunning] = useState(false);
+  const [backfillDone, setBackfillDone] = useState<null | { total: number }>(null);
+
+  // ESC para cerrar
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (preview) setPreview(null);
+        else if (reviewEditing) setReviewEditing(null);
+        else onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, preview, reviewEditing]);
+
+  const reviewByPath = useMemo(() => {
+    const m = new Map<string, BankFileReview>();
+    for (const r of reviews) m.set(r.storage_path, r);
+    return m;
+  }, [reviews]);
+
+  const reviewerById = useMemo(() => {
+    const m = new Map<string, Reviewer>();
+    for (const u of reviewers) m.set(u.id, u);
+    return m;
+  }, [reviewers]);
+
+  const movsByStatement = useMemo(() => {
+    const m = new Map<string, MovementEnriched[]>();
+    for (const mv of movements) {
+      // El campo real puede ser statement_id o bank_statement_id según ingest usado
+      const stId = (mv as any).statement_id ?? (mv as any).bank_statement_id;
+      if (!stId) continue;
+      if (!m.has(stId)) m.set(stId, []);
+      m.get(stId)!.push(mv);
+    }
+    return m;
+  }, [movements]);
+
+  // Agrupar por storage_path (dedup: si dos statements comparten path, mergean movimientos)
+  const groups = useMemo<StFileGroup[]>(() => {
+    const map = new Map<string, StFileGroup>();
+    for (const st of statements) {
+      if (!st.storage_path) continue;
+      const ext = (st.storage_path.split(".").pop() || "").toLowerCase();
+      // Fallback humano: si no hay original_filename, mostramos SÓLO el basename
+      // (nunca el path completo con companyId, es ruido para el contador)
+      const filename = st.original_filename
+        || `Extracto sin nombre (${st.storage_path.split("/").pop() ?? "?"})`;
+      const movs = movsByStatement.get(st.id) ?? [];
+
+      if (map.has(st.storage_path)) {
+        // Segundo statement con mismo path → mergear movimientos
+        const existing = map.get(st.storage_path)!;
+        existing.movements = [...existing.movements, ...movs];
+        existing.ingresos += movs.filter(m => m.tipo === "ingreso").reduce((a, b) => a + Number(b.monto ?? 0), 0);
+        existing.egresos  += movs.filter(m => m.tipo === "egreso").reduce((a, b) => a + Number(b.monto ?? 0), 0);
+        // Si el existente no tenía nombre y este sí, actualizamos
+        if (st.original_filename && !existing.statement.original_filename) {
+          existing.filename = st.original_filename;
+          existing.statement = st;
+        }
+        continue;
+      }
+
+      const ingresos = movs.filter(m => m.tipo === "ingreso").reduce((a, b) => a + Number(b.monto ?? 0), 0);
+      const egresos  = movs.filter(m => m.tipo === "egreso").reduce((a, b) => a + Number(b.monto ?? 0), 0);
+      map.set(st.storage_path, {
+        storage_path: st.storage_path,
+        statement: st,
+        filename,
+        extension: ext,
+        movements: movs,
+        ingresos,
+        egresos
+      });
+    }
+    return Array.from(map.values());
+  }, [statements, movsByStatement]);
+
+  const bancosDisponibles = useMemo(() => {
+    const set = new Set<string>();
+    groups.forEach(g => { if (g.statement.banco) set.add(g.statement.banco); });
+    return Array.from(set).sort();
+  }, [groups]);
+
+  const filteredGroups = useMemo(() => {
+    const norm = (s: string) => s.toLowerCase();
+    let rows = groups;
+
+    // Ámbito: aplicar filtros del contexto (banco + período)
+    if (scope === "periodo") {
+      if (currentBanco) rows = rows.filter(g => g.statement.banco === currentBanco);
+      if (currentPeriodo) rows = rows.filter(g => {
+        const desde = g.statement.periodo_desde ?? "";
+        const hasta = g.statement.periodo_hasta ?? "";
+        // El extracto "cubre" el período si el YYYY-MM cae entre desde y hasta
+        return (desde && desde.startsWith(currentPeriodo))
+          || (hasta && hasta.startsWith(currentPeriodo))
+          || (desde && hasta && desde <= `${currentPeriodo}-31` && hasta >= `${currentPeriodo}-01`);
+      });
+    }
+    // Sólo aplicamos bancoFiltro si no hay banco fijado por contexto (evita filtro doble oculto)
+    if (bancoFiltro !== "__todos__" && !(scope === "periodo" && currentBanco)) {
+      rows = rows.filter(g => g.statement.banco === bancoFiltro);
+    }
+
+    if (estadoFiltro !== "todos") {
+      rows = rows.filter(g => {
+        const rev = reviewByPath.get(g.storage_path);
+        if (estadoFiltro === "sin_revisar") return !rev;
+        if (estadoFiltro === "ok") return rev?.status === "ok";
+        if (estadoFiltro === "observaciones") return rev && rev.status !== "ok";
+        if (estadoFiltro === "anomalias") return g.movements.length === 0 || !g.statement.periodo_desde;
+        return true;
+      });
+    }
+
+    if (q) {
+      const s = norm(q);
+      rows = rows.filter(g =>
+        norm(g.filename).includes(s) ||
+        norm(g.statement.banco ?? "").includes(s) ||
+        norm(g.statement.cuenta ?? "").includes(s) ||
+        norm(g.statement.cbu ?? "").includes(s)
+      );
+    }
+
+    rows = rows.slice().sort((a, b) => {
+      switch (orderBy) {
+        case "fecha":       return (b.statement.periodo_desde ?? "").localeCompare(a.statement.periodo_desde ?? "");
+        case "movimientos": return b.movements.length - a.movements.length;
+        case "monto":       return (b.ingresos + b.egresos) - (a.ingresos + a.egresos);
+      }
+    });
+    return rows;
+  }, [groups, scope, currentBanco, currentPeriodo, bancoFiltro, estadoFiltro, q, orderBy, reviewByPath]);
+
+  const counts = useMemo(() => ({
+    todos: groups.length,
+    sin_revisar: groups.filter(g => !reviewByPath.get(g.storage_path)).length,
+    revisados_ok: groups.filter(g => reviewByPath.get(g.storage_path)?.status === "ok").length,
+    con_obs: groups.filter(g => {
+      const r = reviewByPath.get(g.storage_path);
+      return r && r.status !== "ok";
+    }).length,
+    anomalias: groups.filter(g => g.movements.length === 0 || !g.statement.periodo_desde).length
+  }), [groups, reviewByPath]);
+
+  const totalMovimientos = filteredGroups.reduce((a, g) => a + g.movements.length, 0);
+  const totalIngresos = filteredGroups.reduce((a, g) => a + g.ingresos, 0);
+  const totalEgresos = filteredGroups.reduce((a, g) => a + g.egresos, 0);
+
+  // Detectar archivos sin nombre humano
+  const archivosSinNombre = useMemo(
+    () => groups.filter(g => !(g.statement.original_filename ?? "").trim()).length,
+    [groups]
+  );
+
+  async function openPreview(g: StFileGroup, download = false) {
+    setLoadingId(g.storage_path); setErr(null);
+    try {
+      const url = `/api/bank/file?path=${encodeURIComponent(g.storage_path)}${download ? "&download=1" : ""}`;
+      const r = await fetch(url);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      if (download) {
+        window.location.href = d.url;
+      } else {
+        const kind = isPreviewableBank(g.storage_path);
+        if (kind === "pdf" || kind === "image") {
+          setPreview({ path: g.storage_path, url: d.url, kind, filename: g.filename });
+        } else {
+          window.open(d.url, "_blank");
+        }
+      }
+    } catch (e: any) {
+      setErr("No se pudo abrir el archivo: " + e.message);
+    } finally { setLoadingId(null); }
+  }
+
+  async function saveReview(path: string, status: BankFileReview["status"], note: string) {
+    setErr(null);
+    try {
+      const r = await fetch("/api/file-review", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ storage_path: path, entity_type: "bank_statement", status, note })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      onReviewChange(path, d.review);
+      setReviewEditing(null);
+    } catch (e: any) {
+      setErr("No se pudo guardar la revisión: " + e.message);
+    }
+  }
+
+  async function unreview(path: string) {
+    if (!confirm("¿Quitar la marca de revisado?")) return;
+    setErr(null);
+    try {
+      const r = await fetch(`/api/file-review?storage_path=${encodeURIComponent(path)}&entity_type=bank_statement`, { method: "DELETE" });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      onReviewChange(path, null);
+    } catch (e: any) {
+      setErr("No se pudo quitar la revisión: " + e.message);
+    }
+  }
+
+  function toggleSelect(path: string) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path); else next.add(path);
+      return next;
+    });
+  }
+  function toggleAll() {
+    if (selected.size === filteredGroups.length) setSelected(new Set());
+    else setSelected(new Set(filteredGroups.map(g => g.storage_path)));
+  }
+
+  function exportExcel() {
+    const params = new URLSearchParams();
+    if (scope === "periodo") {
+      if (currentPeriodo) {
+        const [y, m] = currentPeriodo.split("-");
+        params.set("year", y);
+        params.set("month", m);
+      }
+      if (currentBanco) params.set("banco", currentBanco);
+    }
+    if (bancoFiltro !== "__todos__") params.set("banco", bancoFiltro);
+    window.location.href = `/api/bank-files/export?${params.toString()}`;
+  }
+
+  async function downloadZip() {
+    const paths = selected.size ? Array.from(selected) : filteredGroups.map(g => g.storage_path);
+    if (!paths.length) return;
+    if (paths.length > 200) {
+      setErr("El ZIP soporta hasta 200 archivos.");
+      return;
+    }
+    setDownloadingZip(true); setErr(null);
+    try {
+      const r = await fetch("/api/bank-files/zip", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paths })
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        throw new Error(d.error || `HTTP ${r.status}`);
+      }
+      const blob = await r.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `extractos-bancarios-${new Date().toISOString().slice(0, 10)}.zip`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      const failed = r.headers.get("X-Files-Failed");
+      if (failed && failed !== "0") setErr(`${failed} archivo(s) no se pudieron incluir en el ZIP.`);
+    } catch (e: any) {
+      setErr("No se pudo generar el ZIP: " + e.message);
+    } finally { setDownloadingZip(false); }
+  }
+
+  async function backfillPreviewFetch() {
+    setErr(null); setBackfillDone(null);
+    try {
+      const r = await fetch("/api/bank-files/backfill-names", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ dryRun: true })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setBackfillPreview({
+        total: d.would_update ?? 0,
+        ejemplos: (d.previews ?? []).slice(0, 6).map((p: any) => ({ after: p.after }))
+      });
+    } catch (e: any) { setErr("Error en vista previa: " + e.message); }
+  }
+
+  async function backfillApply() {
+    setBackfillRunning(true); setErr(null);
+    try {
+      const r = await fetch("/api/bank-files/backfill-names", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({})
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setBackfillDone({ total: d.procesados ?? 0 });
+      setBackfillPreview(null);
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (e: any) {
+      setErr("Error al aplicar backfill: " + e.message);
+    } finally { setBackfillRunning(false); }
+  }
+
+  function reviewerName(id: string) {
+    const r = reviewerById.get(id);
+    return r?.full_name || r?.email || "Un usuario";
+  }
+
+  return (
+    <>
+      <div className="modal-back" style={{ zIndex: 60 }} onClick={onClose}/>
+      <div className="fixed inset-4 md:inset-8 card soft fade-in overflow-hidden flex flex-col" style={{ zIndex: 70 }}>
+        <div className="px-6 py-4 border-b border-line flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="text-[12px] uppercase tracking-wider text-ink-3">Base de datos de extractos bancarios</div>
+            <div className="sf-display text-[20px] font-semibold mt-1">Auditoría de resúmenes bancarios</div>
+            <div className="text-[12px] text-ink-3 mt-1 max-w-2xl">
+              Cada PDF/CSV de extracto que la IA usó para armar los movimientos. Revisá, marcá controlado, dejá notas y exportá el papel de trabajo.
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button className="btn btn-ghost" onClick={exportExcel} title="Exportar índice a Excel">
+              <Icon.Download/> Exportar índice
+            </button>
+            {(() => {
+              const zipCount = selected.size || filteredGroups.length;
+              const overLimit = zipCount > 200;
+              return (
+                <button className="btn btn-ghost" onClick={downloadZip}
+                        disabled={downloadingZip || zipCount === 0}
+                        title={overLimit
+                          ? `Sólo se pueden descargar 200 archivos por ZIP (tenés ${zipCount}). Ajustá los filtros.`
+                          : selected.size ? `Descargar ${selected.size} seleccionados` : `Descargar ${zipCount} archivos filtrados`}>
+                  <Icon.Download/> {
+                    downloadingZip ? "Generando ZIP…"
+                    : zipCount === 0 ? "ZIP (sin archivos)"
+                    : overLimit ? `ZIP máx. 200 (tenés ${zipCount})`
+                    : selected.size ? `Descargar ${selected.size} (ZIP)`
+                    : `Descargar todos (${zipCount})`
+                  }
+                </button>
+              );
+            })()}
+            <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}><Icon.Close/></button>
+          </div>
+        </div>
+
+        {/* Filtros fila 1 */}
+        <div className="px-6 py-3 border-b border-line flex flex-wrap items-center gap-3">
+          <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
+            <div className={`tab ${scope==="periodo"?"active":""}`} onClick={()=>setScope("periodo")}>
+              {contextLabel}
+            </div>
+            <div className={`tab ${scope==="todos"?"active":""}`} onClick={()=>setScope("todos")}>
+              Todos los períodos
+            </div>
+          </div>
+
+          {/* Sólo mostramos el filtro de bancos cuando el ámbito es "todos", o cuando
+              estamos en "periodo" pero no hay banco fijado por el contexto (currentBanco null).
+              Así evitamos el confuso "filtro doble" que dejaba la lista vacía sin razón obvia. */}
+          {bancosDisponibles.length > 1 && (scope === "todos" || !currentBanco) && (
+            <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
+              <div className={`tab ${bancoFiltro==="__todos__"?"active":""}`} onClick={()=>setBancoFiltro("__todos__")}>
+                Todos los bancos
+              </div>
+              {bancosDisponibles.map(b => (
+                <div key={b} className={`tab ${bancoFiltro===b?"active":""}`} onClick={()=>setBancoFiltro(b)}>
+                  {b}
+                </div>
+              ))}
+            </div>
+          )}
+          {scope === "periodo" && currentBanco && (
+            <div className="chip" style={{ background: "var(--accent-soft)", color: "var(--accent)", fontSize: 11 }}
+                 title="Filtrado por el banco actualmente seleccionado en la vista de movimientos">
+              Banco fijo: {currentBanco}
+            </div>
+          )}
+
+          <div className="flex-1 min-w-[240px] relative">
+            <div className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3"><Icon.Search /></div>
+            <input className="input pl-9" placeholder="Buscar por archivo, banco, cuenta o CBU…"
+                   value={q} onChange={e=>setQ(e.target.value)} />
+          </div>
+        </div>
+
+        {/* Filtros fila 2 */}
+        <div className="px-6 py-3 border-b border-line flex flex-wrap items-center gap-3" style={{ background: "#fafafa" }}>
+          <div className="text-[11px] uppercase tracking-wider text-ink-3">Estado</div>
+          <div className="flex gap-1 p-1 rounded-xl bg-white flex-wrap">
+            {[
+              { k: "todos", t: "Todos", c: counts.todos },
+              { k: "sin_revisar", t: "Sin revisar", c: counts.sin_revisar },
+              { k: "ok", t: "OK", c: counts.revisados_ok },
+              { k: "observaciones", t: "Con observaciones", c: counts.con_obs },
+              ...(counts.anomalias > 0 ? [{ k: "anomalias", t: "⚠ Anomalías", c: counts.anomalias }] : [])
+            ].map(o => (
+              <div key={o.k}
+                   className={`tab ${estadoFiltro===o.k?"active":""}`}
+                   onClick={()=>setEstadoFiltro(o.k as any)}>
+                {o.t}<span className="ml-1 text-[10px] text-ink-3">· {o.c}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="ml-auto flex items-center gap-2">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Ordenar por</div>
+            <select className="input" style={{ padding:"4px 10px", fontSize: 12, width: 180 }}
+                    value={orderBy} onChange={e => setOrderBy(e.target.value as any)}>
+              <option value="fecha">Fecha (más reciente)</option>
+              <option value="movimientos">Cantidad movimientos</option>
+              <option value="monto">Monto operado</option>
+            </select>
+          </div>
+        </div>
+
+        {err && (
+          <div className="mx-6 mt-3 p-2.5 rounded-lg bg-[#fdeaef] text-[#9c2944] text-[12px]">{err}</div>
+        )}
+
+        {/* Banner backfill */}
+        {archivosSinNombre > 0 && !backfillDone && (
+          <div className="mx-6 mt-3 rounded-xl p-3 flex items-center gap-3"
+               style={{ background: "#fcf0dd", border: "1px solid #f0d69a" }}>
+            <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0"
+                 style={{ background:"#fff", color:"#b4730e" }}>
+              <Icon.Warning/>
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-[13px] font-medium" style={{ color:"#8a5709" }}>
+                {archivosSinNombre} extracto{archivosSinNombre === 1 ? "" : "s"} sin nombre humano
+              </div>
+              <div className="text-[11px]" style={{ color:"#b4730e" }}>
+                Los extractos que cargaste antes aparecen con un UUID. Puedo generar nombres como "Extracto Santander - Mar 2026.pdf".
+              </div>
+            </div>
+            {!backfillPreview ? (
+              <button className="btn btn-primary" onClick={backfillPreviewFetch}>Vista previa</button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <button className="btn btn-ghost" onClick={() => setBackfillPreview(null)} disabled={backfillRunning}>Cancelar</button>
+                <button className="btn btn-primary" onClick={backfillApply} disabled={backfillRunning}>
+                  {backfillRunning ? "Aplicando…" : `Renombrar ${backfillPreview.total}`}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        {backfillPreview && backfillPreview.ejemplos.length > 0 && (
+          <div className="mx-6 mt-2 rounded-xl p-3" style={{ background:"#fafafa", border:"1px solid var(--line)" }}>
+            <div className="text-[11px] uppercase tracking-wider text-ink-3 mb-2">
+              Vista previa — {backfillPreview.total} extracto(s) recibirán:
+            </div>
+            <div className="space-y-1">
+              {backfillPreview.ejemplos.map((e, i) => (
+                <div key={i} className="text-[12px] font-mono">{e.after}</div>
+              ))}
+              {backfillPreview.total > backfillPreview.ejemplos.length && (
+                <div className="text-[11px] text-ink-3 mt-1">
+                  … y {backfillPreview.total - backfillPreview.ejemplos.length} extracto(s) más.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        {backfillDone && (
+          <div className="mx-6 mt-3 rounded-xl p-3 flex items-center gap-3"
+               style={{ background: "#e6f6ed", border: "1px solid #b6e2c8" }}>
+            <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0"
+                 style={{ background:"#fff", color:"#30a46c" }}>
+              <Icon.Check/>
+            </div>
+            <div className="text-[13px]" style={{ color:"#218358" }}>
+              Se renombraron {backfillDone.total} extracto(s). Recargando…
+            </div>
+          </div>
+        )}
+
+        {/* KPIs */}
+        <div className="grid grid-cols-4 gap-3 px-6 py-4 border-b border-line" style={{ background: "#fafafa" }}>
+          <div className="rounded-xl p-3 bg-white">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Extractos</div>
+            <div className="sf-display text-[22px] font-semibold mt-1">{filteredGroups.length}</div>
+          </div>
+          <div className="rounded-xl p-3 bg-white">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Movimientos</div>
+            <div className="sf-display text-[22px] font-semibold mt-1">{totalMovimientos}</div>
+          </div>
+          <div className="rounded-xl p-3 bg-white">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Ingresos</div>
+            <div className="sf-display text-[22px] font-semibold mt-1" style={{ color:"#30a46c" }}>{money(totalIngresos)}</div>
+          </div>
+          <div className="rounded-xl p-3 bg-white">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Egresos</div>
+            <div className="sf-display text-[22px] font-semibold mt-1" style={{ color:"#f04f6f" }}>{money(totalEgresos)}</div>
+          </div>
+        </div>
+
+        {/* Lista */}
+        <div className="flex-1 overflow-y-auto scroll-clean" style={{ overscrollBehavior: "contain" }}>
+          {filteredGroups.length === 0 ? (
+            <div className="p-16 text-center text-ink-3">
+              <div className="w-14 h-14 mx-auto rounded-2xl flex items-center justify-center bg-brand-soft text-brand mb-3">
+                <Icon.Folder/>
+              </div>
+              <div className="sf-display text-[15px] font-semibold text-ink-1">No hay extractos con estos filtros</div>
+              <div className="text-[12px] mt-1">Cambiá el ámbito o los filtros.</div>
+            </div>
+          ) : (
+            <table className="clean">
+              <thead>
+                <tr>
+                  <th style={{ width: 40 }}>
+                    <input type="checkbox"
+                           checked={filteredGroups.length > 0 && selected.size === filteredGroups.length}
+                           disabled={filteredGroups.length === 0}
+                           onChange={toggleAll}
+                           title="Seleccionar/deseleccionar todos"/>
+                  </th>
+                  <th>Extracto</th>
+                  <th>Banco / Cuenta</th>
+                  <th>Período</th>
+                  <th className="text-right">Movs.</th>
+                  <th className="text-right">Ingresos</th>
+                  <th className="text-right">Egresos</th>
+                  <th>Estado</th>
+                  <th className="text-right">Acciones</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredGroups.map(g => {
+                  const review = reviewByPath.get(g.storage_path);
+                  const isExpanded = expanded === g.storage_path;
+                  const isSelected = selected.has(g.storage_path);
+                  return (
+                    <React.Fragment key={g.storage_path}>
+                      <tr style={isSelected ? { background: "var(--accent-soft)" } : undefined}>
+                        <td>
+                          <input type="checkbox" checked={isSelected} onChange={() => toggleSelect(g.storage_path)}/>
+                        </td>
+                        <td>
+                          <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
+                                 style={{ background:"var(--accent-soft)", color:"var(--accent)" }}>
+                              <Icon.File/>
+                            </div>
+                            <div className="min-w-0">
+                              <div className="font-medium truncate" style={{ maxWidth: 300 }} title={g.filename}>
+                                {g.filename}
+                              </div>
+                              <div className="text-[11px] text-ink-3 flex items-center gap-2 flex-wrap">
+                                {g.statement.created_at && <span>Cargado {String(g.statement.created_at).slice(0, 10)}</span>}
+                                <span className="chip" style={{ background:"#ececf0", color:"#6e6e73", fontSize:10, padding:"1px 6px" }}>
+                                  {g.extension.toUpperCase() || "?"}
+                                </span>
+                                {(() => {
+                                  const mn = g.statement.moneda ?? "ARS";
+                                  if (mn === "ARS") return null;
+                                  return (
+                                    <span className="chip"
+                                          style={{ background:"#e6f6ed", color:"#218358", fontSize:10, padding:"1px 6px", fontWeight: 600 }}
+                                          title="Moneda del extracto">
+                                      {mn}
+                                    </span>
+                                  );
+                                })()}
+                                {g.movements.length === 0 && (
+                                  <span className="chip"
+                                        style={{ background:"#fcf0dd", color:"#b4730e", fontSize:10, padding:"1px 6px" }}
+                                        title="Este extracto se subió pero la IA no detectó movimientos. Revisá el archivo original.">
+                                    ⚠ Sin movimientos detectados
+                                  </span>
+                                )}
+                                {(g.statement.periodo_desde ?? "") === "" && (
+                                  <span className="chip"
+                                        style={{ background:"#fcf0dd", color:"#b4730e", fontSize:10, padding:"1px 6px" }}
+                                        title="La IA no pudo determinar el período de este extracto">
+                                    ⚠ Sin período
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                        <td>
+                          <div className="flex flex-col" style={{ lineHeight: 1.2 }}>
+                            <span className="text-[13px] font-medium">{g.statement.banco ?? "—"}</span>
+                            <span className="text-[11px] text-ink-3 font-mono">
+                              {g.statement.cuenta ?? g.statement.cbu ?? "—"}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="text-ink-2 text-[12px]">
+                          {g.statement.periodo_desde && g.statement.periodo_hasta
+                            ? `${g.statement.periodo_desde} → ${g.statement.periodo_hasta}`
+                            : (g.statement.periodo_desde ?? "—")}
+                        </td>
+                        <td className="text-right">
+                          <button
+                            className="chip"
+                            style={{ background:"var(--accent-soft)", color:"var(--accent)", cursor:"pointer", border:"none" }}
+                            onClick={() => setExpanded(isExpanded ? null : g.storage_path)}>
+                            {g.movements.length} {isExpanded ? "▲" : "▼"}
+                          </button>
+                        </td>
+                        <td className="text-right font-semibold" style={{ color:"#30a46c" }}>+ {money(g.ingresos)}</td>
+                        <td className="text-right font-semibold" style={{ color:"#f04f6f" }}>− {money(g.egresos)}</td>
+                        <td>
+                          {review ? (
+                            <div className="flex flex-col" style={{ lineHeight: 1.15 }}>
+                              <Badge tone={review.status === "ok" ? "success" : review.status === "con_observacion" ? "warning" : "danger"}>
+                                {review.status === "ok" ? "✓ Revisado" : review.status === "con_observacion" ? "Obs." : "Con error"}
+                              </Badge>
+                              <span className="text-[10px] text-ink-3 mt-0.5">
+                                {reviewerName(review.reviewed_by)} · {review.reviewed_at.slice(0, 10)}
+                              </span>
+                            </div>
+                          ) : (
+                            <Badge tone="pendiente">Sin revisar</Badge>
+                          )}
+                        </td>
+                        <td className="text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            {(() => {
+                              const embed = isPreviewableBank(g.storage_path);
+                              const embedable = embed === "pdf" || embed === "image";
+                              return (
+                                <button
+                                  className="btn btn-ghost"
+                                  style={{ padding:"6px 10px", fontSize: 12 }}
+                                  onClick={() => openPreview(g)}
+                                  disabled={loadingId === g.storage_path}
+                                  title={embedable
+                                    ? "Ver archivo en el panel embebido"
+                                    : "Abrir en pestaña nueva (Excel/CSV no se puede embeber en el navegador)"}>
+                                  {loadingId === g.storage_path ? "…" : (embedable ? "Ver" : "Abrir ↗")}
+                                </button>
+                              );
+                            })()}
+                            <button
+                              className="btn btn-ghost"
+                              style={{ padding:"6px 10px", fontSize: 12 }}
+                              onClick={() => openPreview(g, true)}
+                              title="Descargar original">
+                              <Icon.Download/>
+                            </button>
+                            <button
+                              className="btn btn-ghost"
+                              style={{ padding:"6px 10px", fontSize: 12 }}
+                              onClick={() => setCurrencyEditing(g)}
+                              title="Cambiar la moneda de este extracto (aplica a todos sus movimientos)">
+                              {g.statement.moneda ?? "ARS"}
+                            </button>
+                            <button
+                              className="btn btn-primary"
+                              style={{ padding:"6px 10px", fontSize: 12 }}
+                              onClick={() => setReviewEditing(g.storage_path)}
+                              title="Marcar como revisado">
+                              {review ? "Editar" : "Revisar"}
+                            </button>
+                            {review && (
+                              <button
+                                className="btn btn-ghost"
+                                style={{ padding:"6px 8px", fontSize: 12, color:"#f04f6f" }}
+                                onClick={() => unreview(g.storage_path)}
+                                title="Quitar marca">
+                                <Icon.Close/>
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+
+                      {isExpanded && (
+                        <tr>
+                          <td colSpan={9} style={{ background: "#fafafa", padding: 0 }}>
+                            <div className="p-4 space-y-3">
+                              {review?.note && (
+                                <div className="rounded-xl p-3" style={{ background: "#fff", border: "1px solid var(--line)" }}>
+                                  <div className="text-[11px] uppercase tracking-wider text-ink-3 mb-1">
+                                    Nota del contador — {reviewerName(review.reviewed_by)}
+                                  </div>
+                                  <div className="text-[13px] whitespace-pre-wrap">{review.note}</div>
+                                </div>
+                              )}
+                              <div className="flex items-center justify-between">
+                                <div className="text-[11px] uppercase tracking-wider text-ink-3">
+                                  {g.movements.length === 0
+                                    ? "Sin movimientos en este extracto"
+                                    : g.movements.length <= 50
+                                      ? `${g.movements.length} movimiento${g.movements.length === 1 ? "" : "s"}`
+                                      : `Primeros 50 de ${g.movements.length} movimientos`}
+                                </div>
+                                {g.movements.length > 50 && (
+                                  <button
+                                    className="btn btn-ghost"
+                                    style={{ padding:"4px 10px", fontSize: 11 }}
+                                    onClick={() => {
+                                      onJumpToMovements(
+                                        g.statement.banco || null,
+                                        g.statement.periodo_desde ? g.statement.periodo_desde.slice(0, 7) : null
+                                      );
+                                    }}
+                                  >
+                                    Ver los {g.movements.length} en la tabla ↗
+                                  </button>
+                                )}
+                              </div>
+                              <div className="rounded-xl overflow-hidden" style={{ background: "#fff", border: "1px solid var(--line)" }}>
+                                <table className="clean">
+                                  <thead>
+                                    <tr>
+                                      <th style={{ background: "#fff" }}>Fecha</th>
+                                      <th style={{ background: "#fff" }}>Descripción</th>
+                                      <th style={{ background: "#fff" }}>Contraparte</th>
+                                      <th style={{ background: "#fff" }}>Tipo</th>
+                                      <th style={{ background: "#fff" }} className="text-right">Importe</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {g.movements
+                                      .slice()
+                                      .sort((a, b) => (b.fecha ?? "").localeCompare(a.fecha ?? ""))
+                                      .slice(0, 50)
+                                      .map(m => (
+                                        <tr key={m.id}>
+                                          <td className="text-ink-2">{m.fecha}</td>
+                                          <td className="truncate" style={{ maxWidth: 320 }} title={m.descripcion}>
+                                            {m.descripcion}
+                                          </td>
+                                          <td className="text-ink-2 text-[12px]">
+                                            {m.nombre_contraparte ?? "—"}
+                                          </td>
+                                          <td>
+                                            <Badge tone={m.tipo === "ingreso" ? "ingreso" : "egreso"}>
+                                              {m.tipo === "ingreso" ? "Ingreso" : "Egreso"}
+                                            </Badge>
+                                          </td>
+                                          <td className="text-right font-semibold"
+                                              style={{ color: m.tipo === "ingreso" ? "#30a46c" : "#f04f6f" }}>
+                                            {m.tipo === "ingreso" ? "+ " : "− "}{money(Number(m.monto))}
+                                          </td>
+                                        </tr>
+                                      ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      {/* Preview embebido */}
+      {preview && (
+        <BankPreviewPanel preview={preview} onClose={() => setPreview(null)}/>
+      )}
+
+      {/* Modal de revisión */}
+      {reviewEditing && (
+        <BankReviewEditor
+          path={reviewEditing}
+          current={reviewByPath.get(reviewEditing) ?? null}
+          filename={groups.find(g => g.storage_path === reviewEditing)?.filename ?? "Extracto"}
+          onClose={() => setReviewEditing(null)}
+          onSave={saveReview}
+        />
+      )}
+
+      {currencyEditing && (
+        <StatementCurrencyEditor
+          group={currencyEditing}
+          onClose={() => setCurrencyEditing(null)}
+          onDone={() => {
+            setCurrencyEditing(null);
+            // Recargar para ver los nuevos TCs de referencia
+            setTimeout(() => window.location.reload(), 400);
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+// ============================================================================
+// Editor de moneda del extracto — cambia moneda y busca TC del BCRA para cada mov
+// ============================================================================
+
+function StatementCurrencyEditor({
+  group, onClose, onDone
+}: {
+  group: StFileGroup;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  useLockBodyScroll();
+  const [moneda, setMoneda] = useState<"ARS" | "USD" | "EUR">(
+    (group.statement.moneda as any) ?? "ARS"
+  );
+  const [fetchTc, setFetchTc] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [result, setResult] = useState<null | { updated: number; total: number; missing: number; warnings: string[] }>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function submit() {
+    setSaving(true); setErr(null);
+    try {
+      const r = await fetch("/api/bank/statement/update-currency", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          statement_id: group.statement.id,
+          moneda,
+          fetch_tc: fetchTc
+        })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setResult({
+        updated: d.updated_movements ?? 0,
+        total: d.total_movements ?? 0,
+        missing: d.missing_tc_count ?? 0,
+        warnings: d.warnings ?? []
+      });
+    } catch (e: any) {
+      setErr(e.message);
+    } finally { setSaving(false); }
+  }
+
+  return (
+    <>
+      <div className="modal-back" style={{ zIndex: 85 }} onClick={onClose}/>
+      <div className="fixed right-6 top-6 bottom-6 w-[460px] card soft p-6 fade-in overflow-y-auto scroll-clean" style={{ zIndex: 95, overscrollBehavior: "contain" }}>
+        <div className="flex items-start justify-between mb-3">
+          <div>
+            <div className="text-[12px] uppercase tracking-wider text-ink-3">Moneda del extracto</div>
+            <div className="sf-display text-[18px] font-semibold mt-1 truncate" title={group.filename}>{group.filename}</div>
+            <div className="text-[11px] text-ink-3 mt-0.5">
+              {group.movements.length} movimiento{group.movements.length === 1 ? "" : "s"} · Actualmente: <b>{group.statement.moneda ?? "ARS"}</b>
+            </div>
+          </div>
+          <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}><Icon.Close/></button>
+        </div>
+
+        <div className="space-y-3 mt-4">
+          <div>
+            <div className="text-[11px] font-medium text-ink-2 mb-2">Nueva moneda</div>
+            <div className="space-y-2">
+              {[
+                { k: "ARS", label: "Pesos argentinos (ARS)", desc: "Cuenta en pesos, sin TC de referencia" },
+                { k: "USD", label: "Dólares (USD)",           desc: "Cuenta en dólares, cada mov con TC del BCRA como referencia" },
+                { k: "EUR", label: "Euros (EUR)",             desc: "Cuenta en euros, cada mov con TC del BCRA como referencia" }
+              ].map(o => (
+                <label key={o.k}
+                       className="flex items-start gap-3 p-3 rounded-xl cursor-pointer"
+                       style={{
+                         border: `1.5px solid ${moneda === o.k ? "var(--accent)" : "var(--line)"}`,
+                         background: moneda === o.k ? "var(--accent-soft)" : "#fff"
+                       }}>
+                  <input type="radio" name="curr" checked={moneda === o.k}
+                         onChange={() => setMoneda(o.k as any)} style={{ marginTop: 3 }}/>
+                  <div>
+                    <div className="text-[13px] font-medium">{o.label}</div>
+                    <div className="text-[11px] text-ink-3">{o.desc}</div>
+                  </div>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {moneda !== "ARS" && (
+            <label className="flex items-start gap-2 p-3 rounded-xl" style={{ background:"#fafafa", border:"1px solid var(--line)" }}>
+              <input type="checkbox" checked={fetchTc} onChange={e => setFetchTc(e.target.checked)} style={{ marginTop: 3 }}/>
+              <div className="text-[12px]">
+                <div className="font-medium">Buscar TC del BCRA</div>
+                <div className="text-ink-3 text-[11px]">
+                  Para cada fecha de movimiento, guarda el TC oficial del BCRA como referencia informativa (no convierte los montos).
+                </div>
+              </div>
+            </label>
+          )}
+
+          {err && <div className="p-2.5 rounded-lg bg-[#fdeaef] text-[#9c2944] text-[12px]">{err}</div>}
+
+          {result && (
+            <div className="p-3 rounded-xl" style={{ background:"#e6f6ed", border:"1px solid #b6e2c8" }}>
+              <div className="text-[13px] font-medium" style={{ color:"#218358" }}>
+                ✓ {result.updated} de {result.total} movimiento{result.total === 1 ? "" : "s"} actualizado{result.total === 1 ? "" : "s"}
+              </div>
+              {result.missing > 0 && (
+                <div className="text-[11px] text-ink-2 mt-1">
+                  {result.missing} fecha(s) sin TC del BCRA — quedaron sin referencia y podés setearlas manualmente.
+                </div>
+              )}
+              {result.warnings.length > 0 && (
+                <ul className="text-[11px] text-ink-3 mt-1 list-disc list-inside">
+                  {result.warnings.map((w, i) => <li key={i}>{w}</li>)}
+                </ul>
+              )}
+              <button className="btn btn-primary mt-3" onClick={onDone}>Cerrar y recargar</button>
+            </div>
+          )}
+
+          {!result && (
+            <div className="flex justify-end gap-2 pt-2">
+              <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
+              <button className="btn btn-primary" onClick={submit} disabled={saving}>
+                {saving ? "Aplicando…" : `Cambiar a ${moneda}`}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function BankPreviewPanel({
+  preview, onClose
+}: { preview: { path: string; url: string; kind: string; filename: string }; onClose: () => void }) {
+  useLockBodyScroll();
+  return (
+    <>
+      <div className="modal-back" style={{ zIndex: 80 }} onClick={onClose}/>
+      <div className="fixed inset-4 md:inset-16 card soft fade-in overflow-hidden flex flex-col" style={{ zIndex: 90 }}>
+        <div className="px-4 py-3 border-b border-line flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <div className="text-[11px] uppercase tracking-wider text-ink-3">Vista previa del extracto</div>
+            <div className="sf-display text-[15px] font-semibold truncate">{preview.filename}</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <a className="btn btn-ghost" href={preview.url} target="_blank" rel="noreferrer">
+              <Icon.Link/> Abrir en pestaña
+            </a>
+            <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}>
+              <Icon.Close/>
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-hidden" style={{ background: "#525659" }}>
+          {preview.kind === "pdf" ? (
+            <iframe src={preview.url} className="w-full h-full" style={{ border: 0 }} title="Preview PDF"/>
+          ) : preview.kind === "image" ? (
+            <div className="w-full h-full flex items-center justify-center overflow-auto">
+              <img src={preview.url} alt={preview.filename} style={{ maxWidth: "100%", maxHeight: "100%" }}/>
+            </div>
+          ) : (
+            <div className="w-full h-full flex items-center justify-center text-white text-[13px]">
+              Este formato no se puede previsualizar embebido.
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function BankReviewEditor({
+  path, current, filename, onClose, onSave
+}: {
+  path: string;
+  current: BankFileReview | null;
+  filename: string;
+  onClose: () => void;
+  onSave: (path: string, status: BankFileReview["status"], note: string) => Promise<void>;
+}) {
+  useLockBodyScroll();
+  const [status, setStatus] = useState<BankFileReview["status"]>(current?.status ?? "ok");
+  const [note, setNote] = useState(current?.note ?? "");
+  const [saving, setSaving] = useState(false);
+
+  async function submit() {
+    setSaving(true);
+    try { await onSave(path, status, note); }
+    finally { setSaving(false); }
+  }
+
+  return (
+    <>
+      <div className="modal-back" style={{ zIndex: 85 }} onClick={onClose}/>
+      <div className="fixed right-6 top-6 bottom-6 w-[460px] card soft p-6 fade-in overflow-y-auto scroll-clean" style={{ zIndex: 95, overscrollBehavior: "contain" }}>
+        <div className="flex items-start justify-between mb-3">
+          <div>
+            <div className="text-[12px] uppercase tracking-wider text-ink-3">Revisión contable</div>
+            <div className="sf-display text-[18px] font-semibold mt-1 truncate" title={filename}>{filename}</div>
+            <div className="text-[11px] text-ink-3 mt-0.5">Marcá el resultado del control y dejá una nota si hace falta.</div>
+          </div>
+          <button className="btn btn-ghost" style={{padding:"6px 10px"}} onClick={onClose}><Icon.Close/></button>
+        </div>
+
+        <div className="space-y-3 mt-4">
+          <div>
+            <div className="text-[11px] font-medium text-ink-2 mb-2">Resultado del control</div>
+            <div className="space-y-2">
+              {[
+                { k: "ok",              label: "Revisado — todo OK",           desc: "Los movimientos coinciden con el extracto original",     tone: "#30a46c", bg: "#e6f6ed" },
+                { k: "con_observacion", label: "Con observaciones",            desc: "Requiere aclaración o hay diferencias menores",           tone: "#b4730e", bg: "#fcf0dd" },
+                { k: "con_error",       label: "Con error — necesita corregir", desc: "Hay diferencias que hay que corregir",                    tone: "#c02648", bg: "#fdeaef" }
+              ].map(o => (
+                <label key={o.k}
+                       className="flex items-start gap-3 p-3 rounded-xl cursor-pointer"
+                       style={{
+                         border: `1.5px solid ${status === o.k ? o.tone : "var(--line)"}`,
+                         background: status === o.k ? o.bg : "#fff"
+                       }}>
+                  <input type="radio" name="bank-status" checked={status === o.k}
+                         onChange={() => setStatus(o.k as any)} style={{ marginTop: 3 }}/>
+                  <div>
+                    <div className="text-[13px] font-medium" style={{ color: status === o.k ? o.tone : undefined }}>
+                      {o.label}
+                    </div>
+                    <div className="text-[11px] text-ink-3">{o.desc}</div>
+                  </div>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[11px] font-medium text-ink-2 mb-1">Nota (opcional)</div>
+            <textarea className="input"
+                      style={{ minHeight: 100, resize: "vertical" }}
+                      placeholder="Ej: Falta conciliar la transferencia del 15/03. Confirmé saldo inicial contra libro."
+                      value={note} onChange={e => setNote(e.target.value)}/>
+          </div>
+
+          {current && (
+            <div className="text-[11px] text-ink-3">
+              Revisado por última vez el {current.reviewed_at.slice(0, 10)}.
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
+            <button className="btn btn-primary" onClick={submit} disabled={saving}>
+              {saving ? "Guardando…" : (current ? "Actualizar" : "Marcar como revisado")}
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ============================================================================
+// KPIs separados por moneda
+// ============================================================================
+
+const MONEDA_SIMBOLOS: Record<string, string> = {
+  ARS: "$",
+  USD: "u$s",
+  EUR: "€",
+  OTRA: "",
+};
+
+const MONEDA_LABELS: Record<string, string> = {
+  ARS: "Pesos",
+  USD: "Dólares",
+  EUR: "Euros",
+  OTRA: "Otra moneda",
+};
+
+function fmtMoneda(monto: number, moneda: string): string {
+  const simbolo = MONEDA_SIMBOLOS[moneda] ?? "";
+  const num = new Intl.NumberFormat("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(monto);
+  return `${simbolo} ${num}`.trim();
+}
+
+function KpisPorMoneda({
+  totalesPorMoneda, totalMovimientos, conciliados, pendientes, contextLabel
+}: {
+  totalesPorMoneda: Map<string, { ingresos: number; egresos: number; saldo: number; count: number }>;
+  totalMovimientos: number;
+  conciliados: number;
+  pendientes: number;
+  contextLabel: string;
+}) {
+  const monedas = Array.from(totalesPorMoneda.keys())
+    .sort((a, b) => (b === "ARS" ? -1 : 1)); // ARS primero
+  const hayMulti = monedas.length > 1;
+
+  if (monedas.length === 0) {
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-5">
+        <Kpi label="Ingresos"   value={money(0)} hint={contextLabel} />
+        <Kpi label="Egresos"    value={money(0)} hint="Pagos, impuestos y comisiones" />
+        <Kpi label="Saldo neto" value={money(0)} hint="Diferencia del período" />
+        <Kpi label="Movimientos" value={`${totalMovimientos}`} hint={`${conciliados} conciliados · ${pendientes} pendientes`} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {monedas.map(mn => {
+        const t = totalesPorMoneda.get(mn)!;
+        return (
+          <div key={mn}>
+            {hayMulti && (
+              <div className="text-[11px] uppercase tracking-wider text-ink-3 mb-2 flex items-center gap-2">
+                <span className="chip" style={{ background: mn === "ARS" ? "var(--accent-soft)" : "#e6f6ed", color: mn === "ARS" ? "var(--accent)" : "#218358", fontSize: 11 }}>
+                  {mn}
+                </span>
+                <span>{MONEDA_LABELS[mn] ?? mn} · {t.count} movimiento{t.count === 1 ? "" : "s"}</span>
+              </div>
+            )}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-5">
+              <Kpi label={`Ingresos${hayMulti ? " " + mn : ""}`}
+                   value={fmtMoneda(t.ingresos, mn)}
+                   hint={contextLabel} />
+              <Kpi label={`Egresos${hayMulti ? " " + mn : ""}`}
+                   value={fmtMoneda(t.egresos, mn)}
+                   hint="Pagos, impuestos y comisiones" />
+              <Kpi label={`Saldo neto${hayMulti ? " " + mn : ""}`}
+                   value={fmtMoneda(t.saldo, mn)}
+                   hint="Diferencia del período" />
+              {!hayMulti && (
+                <Kpi label="Movimientos"
+                     value={`${totalMovimientos}`}
+                     hint={`${conciliados} conciliados · ${pendientes} pendientes`} />
+              )}
+            </div>
+          </div>
+        );
+      })}
+      {hayMulti && (
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-5">
+          <Kpi label="Total movimientos"
+               value={`${totalMovimientos}`}
+               hint={`${conciliados} conciliados · ${pendientes} pendientes · ${monedas.length} monedas`} />
         </div>
       )}
     </div>

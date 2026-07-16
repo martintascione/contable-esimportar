@@ -91,6 +91,8 @@ export interface Invoice {
   updated_at: string;
 }
 
+export type BankCurrency = "ARS" | "USD" | "EUR" | "OTRA";
+
 export interface BankStatement {
   id: string;
   company_id: string;
@@ -100,6 +102,8 @@ export interface BankStatement {
   periodo_desde: string | null;
   periodo_hasta: string | null;
   storage_path: string | null;
+  original_filename?: string | null;
+  moneda?: BankCurrency;
   ai_metadata: Record<string, unknown> | null;
   created_by: string | null;
   created_at: string;
@@ -116,6 +120,9 @@ export interface BankMovement {
   estado: MovementStatus;
   invoice_id: string | null;
   referencia: string | null;
+  moneda?: BankCurrency;
+  tipo_cambio_referencia?: number | null;
+  tipo_cambio_referencia_fuente?: "bcra" | "manual" | null;
   created_at: string;
 }
 

@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { createClient, createAdminClient } from "@/lib/supabase/server";
 import { extractBankStatement } from "@/lib/ai/extract";
 import { findCuitInText, onlyDigits, removeCuitFromText, looksLikeTransfer } from "@/lib/cuit";
+import { getTcBulk, type Moneda } from "@/lib/bcra";
 
 export const runtime = "nodejs";
 export const maxDuration = 90;
@@ -39,6 +40,11 @@ export async function POST(req: NextRequest) {
   }
 
   const banco = data.banco || bancoHint || "Banco desconocido";
+  // La IA detecta la moneda del extracto (default ARS)
+  const monedaExtracto: "ARS" | "USD" | "EUR" | "OTRA" =
+    data.moneda === "USD" ? "USD" :
+    data.moneda === "ARS" ? "ARS" :
+    "ARS";
 
   const admin = createAdminClient();
 
@@ -52,6 +58,8 @@ export async function POST(req: NextRequest) {
       periodo_desde: data.periodo_desde,
       periodo_hasta: data.periodo_hasta,
       storage_path: storagePath,
+      original_filename: file.name,
+      moneda: monedaExtracto,
       ai_metadata: data as any,
       created_by: user.id
     })
@@ -59,6 +67,18 @@ export async function POST(req: NextRequest) {
     .single();
 
   if (stErr) return NextResponse.json({ error: stErr.message }, { status: 500 });
+
+  // Si el extracto es USD/EUR, buscamos TC del BCRA para todas las fechas de una
+  // (una sola consulta cubre todo el rango). Los movs quedan con TC de referencia.
+  let tcMap = new Map<string, number>();
+  if (monedaExtracto !== "ARS") {
+    const fechas = (data.movimientos ?? []).map(m => m.fecha).filter(Boolean);
+    try {
+      tcMap = await getTcBulk(fechas, monedaExtracto as Moneda);
+    } catch {
+      // Si BCRA falla, dejamos los movs sin TC de referencia (se pueden setear después)
+    }
+  }
 
   // Matcheo contra facturas
   const { data: invoices } = await admin
@@ -97,6 +117,9 @@ export async function POST(req: NextRequest) {
       if (match) invoiceId = match.id;
     }
 
+    // TC de referencia: solo para movs de moneda != ARS
+    const tcRef = monedaExtracto !== "ARS" ? (tcMap.get(m.fecha) ?? null) : null;
+
     return {
       company_id: companyId,
       statement_id: statement.id,
@@ -113,7 +136,10 @@ export async function POST(req: NextRequest) {
       es_cuenta_propia: esPropia,
       categoria_detalle: (m as any).categoria_detalle ?? m.categoria ?? null,
       jurisdiccion: (m as any).jurisdiccion ?? null,
-      alicuota: (m as any).alicuota ?? null
+      alicuota: (m as any).alicuota ?? null,
+      moneda: monedaExtracto,
+      tipo_cambio_referencia: tcRef,
+      tipo_cambio_referencia_fuente: tcRef !== null ? "bcra" : null
     };
   });
 
@@ -122,7 +148,21 @@ export async function POST(req: NextRequest) {
     if (insErr) return NextResponse.json({ error: insErr.message }, { status: 500 });
   }
 
-  return NextResponse.json({ ok: true, statement, count: rows.length });
+  const warnings: string[] = [];
+  if (data.moneda == null && (data.movimientos ?? []).length > 0) {
+    warnings.push(
+      "La IA no pudo determinar la moneda del extracto — se asumió ARS. " +
+      "Si es una cuenta USD, cambiala manualmente desde el modal de extractos originales."
+    );
+  }
+  if (monedaExtracto !== "ARS" && tcMap.size === 0 && rows.length > 0) {
+    warnings.push(
+      `Extracto en ${monedaExtracto}: no se pudo obtener ningún TC del BCRA. ` +
+      "Los movimientos quedaron sin TC de referencia. Podés reintentar desde el modal de extractos originales."
+    );
+  }
+
+  return NextResponse.json({ ok: true, statement, count: rows.length, warnings });
 }
 
 /**

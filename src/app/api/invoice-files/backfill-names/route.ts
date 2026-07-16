@@ -171,22 +171,26 @@ function detectExtension(path: string): string {
   return ext;
 }
 
+// Parseamos "YYYY-MM-DD" sin pasar por Date (evita bug de zona horaria UTC → día anterior)
+function parseYmd(s: string): { year: number; month0: number } | null {
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month0 = Number(m[2]) - 1;
+  if (month0 < 0 || month0 > 11) return null;
+  return { year, month0 };
+}
+
 function periodoLabel(desde: string | undefined, hasta: string | undefined): string {
   if (!desde) return "sin fecha";
-  const d = new Date(desde);
-  const h = hasta ? new Date(hasta) : d;
-  if (isNaN(d.getTime())) return "sin fecha";
-  const same =
-    d.getFullYear() === h.getFullYear() &&
-    d.getMonth() === h.getMonth();
-  if (same) {
-    return `${MESES_ABREV[d.getMonth()]} ${d.getFullYear()}`;
-  }
-  const sameYear = d.getFullYear() === h.getFullYear();
-  if (sameYear) {
-    return `${MESES_ABREV[d.getMonth()]}-${MESES_ABREV[h.getMonth()]} ${d.getFullYear()}`;
-  }
-  return `${MESES_ABREV[d.getMonth()]} ${d.getFullYear()} - ${MESES_ABREV[h.getMonth()]} ${h.getFullYear()}`;
+  const d = parseYmd(desde);
+  if (!d) return "sin fecha";
+  const h = hasta ? (parseYmd(hasta) ?? d) : d;
+  const same = d.year === h.year && d.month0 === h.month0;
+  if (same) return `${MESES_ABREV[d.month0]} ${d.year}`;
+  const sameYear = d.year === h.year;
+  if (sameYear) return `${MESES_ABREV[d.month0]}-${MESES_ABREV[h.month0]} ${d.year}`;
+  return `${MESES_ABREV[d.month0]} ${d.year} - ${MESES_ABREV[h.month0]} ${h.year}`;
 }
 
 function sanitize(s: string): string {
