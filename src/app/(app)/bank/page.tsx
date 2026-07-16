@@ -1,6 +1,7 @@
 import { createAdminClient } from "@/lib/supabase/server";
 import { getActiveCompany } from "@/lib/supabase/active";
 import { BankClient } from "@/components/modules/BankClient";
+import { groupBanks } from "@/lib/banks";
 
 export default async function BankPage() {
   const { user, companyId } = await getActiveCompany();
@@ -38,9 +39,19 @@ export default async function BankPage() {
         .eq("company_id", companyId)
         .eq("entity_type", "bank_statement")
     ]);
+    // Consolidamos nombres de bancos: aplica reglas hardcoded + fuzzy match para
+    // agrupar variantes similares (ej. "Bco. XYZ" y "Banco XYZ Argentina" bajo un
+    // único nombre). Se construye desde TODOS los bancos que aparecen en la data,
+    // así el mapa es consistente entre movements y statements.
+    const todosLosBancosCrudos = [
+      ...(mov.data ?? []).map((m: any) => m.bank_statements?.banco),
+      ...(st.data ?? []).map((s: any) => s.banco)
+    ];
+    const bancosMap = groupBanks(todosLosBancosCrudos);
+
     movements = (mov.data ?? []).map((m: any) => ({
       ...m,
-      banco: m.bank_statements?.banco ?? "Sin banco",
+      banco: bancosMap.get(m.bank_statements?.banco ?? "") ?? "Sin banco",
       cuenta: m.bank_statements?.cuenta ?? null,
       cuit_contraparte: m.cuit_contraparte ?? null,
       nombre_contraparte: m.nombre_contraparte ?? null,
@@ -48,7 +59,10 @@ export default async function BankPage() {
       es_cuenta_propia: m.es_cuenta_propia ?? false
     }));
     invoices = inv.data ?? [];
-    statements = st.data ?? [];
+    statements = (st.data ?? []).map((s: any) => ({
+      ...s,
+      banco: bancosMap.get(s.banco ?? "") ?? "Sin banco"
+    }));
     partners = pt.data ?? [];
     fileReviews = fr.data ?? [];
 

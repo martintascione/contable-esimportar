@@ -3,6 +3,7 @@ import { createClient, createAdminClient } from "@/lib/supabase/server";
 import { extractBankStatement } from "@/lib/ai/extract";
 import { findCuitInText, onlyDigits, removeCuitFromText, looksLikeTransfer } from "@/lib/cuit";
 import { getTcBulk, type Moneda } from "@/lib/bcra";
+import { normalizeBancoName, normalizeBancoNameSmart } from "@/lib/banks";
 
 export const runtime = "nodejs";
 export const maxDuration = 90;
@@ -39,14 +40,30 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Error del motor de IA: " + e.message }, { status: 500 });
   }
 
-  const banco = data.banco || bancoHint || "Banco desconocido";
+  const admin = createAdminClient();
+
+  // Normalización inteligente del nombre del banco:
+  //   1. Reglas hardcoded para los bancos conocidos (Galicia, Macro, BBVA, etc.)
+  //   2. Si el resultado no está en la BD pero es "muy parecido" a uno que sí
+  //      (Jaro-Winkler ≥ 0.90 + al menos una palabra significativa en común),
+  //      usa el existente para agrupar. Aprende automáticamente.
+  const { data: bancosExistentesData } = await admin
+    .from("bank_statements")
+    .select("banco")
+    .eq("company_id", companyId);
+  const bancosExistentes = Array.from(new Set(
+    (bancosExistentesData ?? []).map((s: any) => s.banco).filter(Boolean)
+  ));
+  const banco = normalizeBancoNameSmart(
+    data.banco || bancoHint || "Banco desconocido",
+    bancosExistentes
+  );
+
   // La IA detecta la moneda del extracto (default ARS)
   const monedaExtracto: "ARS" | "USD" | "EUR" | "OTRA" =
     data.moneda === "USD" ? "USD" :
     data.moneda === "ARS" ? "ARS" :
     "ARS";
-
-  const admin = createAdminClient();
 
   const { data: statement, error: stErr } = await supabase
     .from("bank_statements")
