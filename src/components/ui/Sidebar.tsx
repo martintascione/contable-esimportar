@@ -44,7 +44,7 @@ export function Sidebar({ user }: { user: { email: string; name: string; role: s
           <Icon.Menu />
         </button>
         <div className="flex-1 min-w-0">
-          <Logo size="sm" subtitle="Panel Contable · esImportar" />
+          <Logo size="sm" stacked subtitle="Panel Contable · esImportar" />
         </div>
       </div>
 
@@ -68,7 +68,7 @@ export function Sidebar({ user }: { user: { email: string; name: string; role: s
       >
         <div className="flex items-center justify-between md:block">
           <div className="px-2 py-3">
-            <Logo size="md" subtitle="esImportar · v1.0" />
+            <Logo size="md" stacked subtitle="esImportar · v1.0" />
           </div>
           <button
             aria-label="Cerrar"

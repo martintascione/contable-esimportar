@@ -24,11 +24,22 @@ const sizeMap: Record<Size, { img: string; text: string; sub: string }> = {
 export function Logo({
   size = "md",
   showText = true,
-  subtitle
-}: { size?: Size; showText?: boolean; subtitle?: string }) {
+  subtitle,
+  stacked = false
+}: {
+  size?: Size;
+  showText?: boolean;
+  subtitle?: string;
+  /**
+   * Si es true, el texto va DEBAJO del logo (útil en containers estrechos
+   * como el sidebar, donde el layout horizontal se corta).
+   * Default: false (layout horizontal).
+   */
+  stacked?: boolean;
+}) {
   const s = sizeMap[size];
   return (
-    <div className="flex items-center gap-3">
+    <div className={stacked ? "flex flex-col items-start gap-1.5" : "flex items-center gap-3"}>
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
         src={BRAND.logoUrl}
@@ -37,14 +48,14 @@ export function Logo({
         style={{ imageRendering: "auto" }}
       />
       {showText && (
-        <div className="min-w-0">
-          <div className={`sf-display ${s.text} font-semibold leading-tight tracking-tight truncate`}>
+        <div className="min-w-0 w-full">
+          <div className={`sf-display ${s.text} font-semibold leading-tight tracking-tight ${stacked ? "" : "truncate"}`}>
             {BRAND.name}
           </div>
           {subtitle ? (
-            <div className={`${s.sub} text-ink-3 leading-tight truncate`}>{subtitle}</div>
+            <div className={`${s.sub} text-ink-3 leading-tight ${stacked ? "" : "truncate"}`}>{subtitle}</div>
           ) : (
-            <div className={`${s.sub} text-ink-3 leading-tight truncate`}>{BRAND.company}</div>
+            <div className={`${s.sub} text-ink-3 leading-tight ${stacked ? "" : "truncate"}`}>{BRAND.company}</div>
           )}
         </div>
       )}
