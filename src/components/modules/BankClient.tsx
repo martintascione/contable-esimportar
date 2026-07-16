@@ -1180,8 +1180,14 @@ function BankFilesModal({
 }) {
   useLockBodyScroll();
 
-  const [scope, setScope] = useState<"periodo" | "todos">("periodo");
-  const [bancoFiltro, setBancoFiltro] = useState<string>("__todos__");
+  // Navegación jerárquica: Banco → Año → Mes
+  // Al abrir, arrancamos con el banco/período que estaba activo en la vista principal.
+  const initialAnio = currentPeriodo ? currentPeriodo.slice(0, 4) : null;
+  const initialMes = currentPeriodo ? currentPeriodo.slice(5, 7) : null;
+  const [selectedBanco, setSelectedBanco] = useState<string | null>(currentBanco);
+  const [selectedAnio, setSelectedAnio] = useState<string | null>(initialAnio);
+  const [selectedMes, setSelectedMes] = useState<string | null>(initialMes);
+
   const [q, setQ] = useState("");
   const [estadoFiltro, setEstadoFiltro] = useState<"todos" | "sin_revisar" | "ok" | "observaciones" | "anomalias">("todos");
   const [orderBy, setOrderBy] = useState<"fecha" | "movimientos" | "monto">("fecha");
@@ -1278,31 +1284,44 @@ function BankFilesModal({
     return Array.from(map.values());
   }, [statements, movsByStatement]);
 
-  const bancosDisponibles = useMemo(() => {
-    const set = new Set<string>();
-    groups.forEach(g => { if (g.statement.banco) set.add(g.statement.banco); });
-    return Array.from(set).sort();
-  }, [groups]);
 
+  // Devuelve el año/mes efectivo (basado en periodo_desde, o periodo_hasta, o created_at)
+  // que usamos para agrupar el extracto en la jerarquía.
+  function anioMesDe(g: StFileGroup): { anio: string | null; mes: string | null } {
+    const p = g.statement.periodo_desde
+      || g.statement.periodo_hasta
+      || (g.statement.created_at ? String(g.statement.created_at).slice(0, 10) : null);
+    if (!p) return { anio: null, mes: null };
+    return { anio: p.slice(0, 4), mes: p.slice(5, 7) };
+  }
+
+  // Filtrar por la selección del sidebar + otros filtros
   const filteredGroups = useMemo(() => {
     const norm = (s: string) => s.toLowerCase();
     let rows = groups;
 
-    // Ámbito: aplicar filtros del contexto (banco + período)
-    if (scope === "periodo") {
-      if (currentBanco) rows = rows.filter(g => g.statement.banco === currentBanco);
-      if (currentPeriodo) rows = rows.filter(g => {
+    // Sidebar: banco → año → mes
+    if (selectedBanco) rows = rows.filter(g => g.statement.banco === selectedBanco);
+    if (selectedAnio) {
+      rows = rows.filter(g => {
+        const { anio } = anioMesDe(g);
+        if (anio === selectedAnio) return true;
+        // Cubre también extractos multi-año (ej. desde dic 2025 hasta ene 2026)
         const desde = g.statement.periodo_desde ?? "";
         const hasta = g.statement.periodo_hasta ?? "";
-        // El extracto "cubre" el período si el YYYY-MM cae entre desde y hasta
-        return (desde && desde.startsWith(currentPeriodo))
-          || (hasta && hasta.startsWith(currentPeriodo))
-          || (desde && hasta && desde <= `${currentPeriodo}-31` && hasta >= `${currentPeriodo}-01`);
+        return (desde && desde.startsWith(selectedAnio))
+          || (hasta && hasta.startsWith(selectedAnio));
       });
     }
-    // Sólo aplicamos bancoFiltro si no hay banco fijado por contexto (evita filtro doble oculto)
-    if (bancoFiltro !== "__todos__" && !(scope === "periodo" && currentBanco)) {
-      rows = rows.filter(g => g.statement.banco === bancoFiltro);
+    if (selectedMes && selectedAnio) {
+      const ym = `${selectedAnio}-${selectedMes}`;
+      rows = rows.filter(g => {
+        const desde = g.statement.periodo_desde ?? "";
+        const hasta = g.statement.periodo_hasta ?? "";
+        return (desde && desde.startsWith(ym))
+          || (hasta && hasta.startsWith(ym))
+          || (desde && hasta && desde <= `${ym}-31` && hasta >= `${ym}-01`);
+      });
     }
 
     if (estadoFiltro !== "todos") {
@@ -1334,7 +1353,33 @@ function BankFilesModal({
       }
     });
     return rows;
-  }, [groups, scope, currentBanco, currentPeriodo, bancoFiltro, estadoFiltro, q, orderBy, reviewByPath]);
+  }, [groups, selectedBanco, selectedAnio, selectedMes, estadoFiltro, q, orderBy, reviewByPath]);
+
+  // Árbol de navegación: Banco → Año → Mes con contadores
+  type TreeAnio = { anio: string; meses: Map<string, StFileGroup[]>; total: number };
+  type TreeBanco = { banco: string; anios: Map<string, TreeAnio>; total: number };
+  const tree = useMemo<Map<string, TreeBanco>>(() => {
+    const map = new Map<string, TreeBanco>();
+    for (const g of groups) {
+      const banco = g.statement.banco || "Sin banco";
+      const { anio, mes } = anioMesDe(g);
+      const anioKey = anio ?? "Sin fecha";
+      const mesKey = mes ?? "??";
+
+      if (!map.has(banco)) map.set(banco, { banco, anios: new Map(), total: 0 });
+      const bt = map.get(banco)!;
+      bt.total++;
+
+      if (!bt.anios.has(anioKey)) bt.anios.set(anioKey, { anio: anioKey, meses: new Map(), total: 0 });
+      const at = bt.anios.get(anioKey)!;
+      at.total++;
+
+      if (!at.meses.has(mesKey)) at.meses.set(mesKey, []);
+      at.meses.get(mesKey)!.push(g);
+    }
+    return map;
+  }, [groups]);
+
 
   const counts = useMemo(() => ({
     todos: groups.length,
@@ -1422,16 +1467,11 @@ function BankFilesModal({
   }
 
   function exportExcel() {
+    // El export respeta la selección jerárquica del sidebar
     const params = new URLSearchParams();
-    if (scope === "periodo") {
-      if (currentPeriodo) {
-        const [y, m] = currentPeriodo.split("-");
-        params.set("year", y);
-        params.set("month", m);
-      }
-      if (currentBanco) params.set("banco", currentBanco);
-    }
-    if (bancoFiltro !== "__todos__") params.set("banco", bancoFiltro);
+    if (selectedBanco) params.set("banco", selectedBanco);
+    if (selectedAnio) params.set("year", selectedAnio);
+    if (selectedMes && selectedAnio) params.set("month", selectedMes);
     window.location.href = `/api/bank-files/export?${params.toString()}`;
   }
 
@@ -1545,45 +1585,38 @@ function BankFilesModal({
           </div>
         </div>
 
-        {/* Filtros fila 1 */}
-        <div className="px-6 py-3 border-b border-line flex flex-wrap items-center gap-3">
-          <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
-            <div className={`tab ${scope==="periodo"?"active":""}`} onClick={()=>setScope("periodo")}>
-              {contextLabel}
-            </div>
-            <div className={`tab ${scope==="todos"?"active":""}`} onClick={()=>setScope("todos")}>
-              Todos los períodos
-            </div>
-          </div>
+        {/* Layout: sidebar de navegación (Banco → Año → Mes) + contenido principal */}
+        <div className="flex-1 flex overflow-hidden">
+          <BiblioSidebar
+            tree={tree}
+            groupsTotal={groups.length}
+            selectedBanco={selectedBanco}
+            selectedAnio={selectedAnio}
+            selectedMes={selectedMes}
+            onSelectAll={() => { setSelectedBanco(null); setSelectedAnio(null); setSelectedMes(null); }}
+            onSelectBanco={(b) => { setSelectedBanco(b); setSelectedAnio(null); setSelectedMes(null); }}
+            onSelectAnio={(b, a) => { setSelectedBanco(b); setSelectedAnio(a); setSelectedMes(null); }}
+            onSelectMes={(b, a, m) => { setSelectedBanco(b); setSelectedAnio(a); setSelectedMes(m); }}
+          />
 
-          {/* Sólo mostramos el filtro de bancos cuando el ámbito es "todos", o cuando
-              estamos en "periodo" pero no hay banco fijado por el contexto (currentBanco null).
-              Así evitamos el confuso "filtro doble" que dejaba la lista vacía sin razón obvia. */}
-          {bancosDisponibles.length > 1 && (scope === "todos" || !currentBanco) && (
-            <div className="flex gap-1 p-1 rounded-xl" style={{ background: "#ececf0" }}>
-              <div className={`tab ${bancoFiltro==="__todos__"?"active":""}`} onClick={()=>setBancoFiltro("__todos__")}>
-                Todos los bancos
+          {/* Contenido principal */}
+          <div className="flex-1 flex flex-col overflow-hidden">
+            {/* Breadcrumb + búsqueda */}
+            <div className="px-6 py-3 border-b border-line flex flex-wrap items-center gap-3">
+              <BreadcrumbNav
+                selectedBanco={selectedBanco}
+                selectedAnio={selectedAnio}
+                selectedMes={selectedMes}
+                onSelectAll={() => { setSelectedBanco(null); setSelectedAnio(null); setSelectedMes(null); }}
+                onSelectBanco={(b) => { setSelectedBanco(b); setSelectedAnio(null); setSelectedMes(null); }}
+                onSelectAnio={(b, a) => { setSelectedBanco(b); setSelectedAnio(a); setSelectedMes(null); }}
+              />
+              <div className="flex-1 min-w-[240px] relative">
+                <div className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3"><Icon.Search /></div>
+                <input className="input pl-9" placeholder="Buscar por archivo, banco, cuenta o CBU…"
+                       value={q} onChange={e=>setQ(e.target.value)} />
               </div>
-              {bancosDisponibles.map(b => (
-                <div key={b} className={`tab ${bancoFiltro===b?"active":""}`} onClick={()=>setBancoFiltro(b)}>
-                  {b}
-                </div>
-              ))}
             </div>
-          )}
-          {scope === "periodo" && currentBanco && (
-            <div className="chip" style={{ background: "var(--accent-soft)", color: "var(--accent)", fontSize: 11 }}
-                 title="Filtrado por el banco actualmente seleccionado en la vista de movimientos">
-              Banco fijo: {currentBanco}
-            </div>
-          )}
-
-          <div className="flex-1 min-w-[240px] relative">
-            <div className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3"><Icon.Search /></div>
-            <input className="input pl-9" placeholder="Buscar por archivo, banco, cuenta o CBU…"
-                   value={q} onChange={e=>setQ(e.target.value)} />
-          </div>
-        </div>
 
         {/* Filtros fila 2 */}
         <div className="px-6 py-3 border-b border-line flex flex-wrap items-center gap-3" style={{ background: "#fafafa" }}>
@@ -1957,6 +1990,8 @@ function BankFilesModal({
             </table>
           )}
         </div>
+          </div>{/* /Contenido principal */}
+        </div>{/* /Layout con sidebar */}
       </div>
 
       {/* Preview embebido */}
@@ -2338,6 +2373,205 @@ function KpisPorMoneda({
                hint={`${conciliados} conciliados · ${pendientes} pendientes · ${monedas.length} monedas`} />
         </div>
       )}
+    </div>
+  );
+}
+
+// ============================================================================
+// Sidebar de navegación jerárquica: Banco → Año → Mes
+// ============================================================================
+
+type TreeAnioSB = { anio: string; meses: Map<string, StFileGroup[]>; total: number };
+type TreeBancoSB = { banco: string; anios: Map<string, TreeAnioSB>; total: number };
+
+function BiblioSidebar({
+  tree, groupsTotal,
+  selectedBanco, selectedAnio, selectedMes,
+  onSelectAll, onSelectBanco, onSelectAnio, onSelectMes
+}: {
+  tree: Map<string, TreeBancoSB>;
+  groupsTotal: number;
+  selectedBanco: string | null;
+  selectedAnio: string | null;
+  selectedMes: string | null;
+  onSelectAll: () => void;
+  onSelectBanco: (banco: string) => void;
+  onSelectAnio: (banco: string, anio: string) => void;
+  onSelectMes: (banco: string, anio: string, mes: string) => void;
+}) {
+  const isAll = !selectedBanco && !selectedAnio && !selectedMes;
+  const bancos = Array.from(tree.values()).sort((a, b) => a.banco.localeCompare(b.banco));
+
+  return (
+    <aside
+      className="border-r border-line overflow-y-auto scroll-clean"
+      style={{ width: 280, background: "#fafafa", overscrollBehavior: "contain" }}
+    >
+      <div className="p-3 border-b border-line" style={{ background: "#fff" }}>
+        <div className="text-[11px] uppercase tracking-wider text-ink-3">Biblioteca</div>
+      </div>
+
+      <div className="p-2">
+        <button
+          className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between ${isAll ? "font-semibold" : ""}`}
+          style={{
+            background: isAll ? "var(--accent-soft)" : "transparent",
+            color: isAll ? "var(--accent)" : "var(--text)"
+          }}
+          onClick={onSelectAll}
+        >
+          <span className="flex items-center gap-2 text-[13px]">
+            <Icon.Folder/> Todos los bancos
+          </span>
+          <span className="chip" style={{
+            background: isAll ? "#fff" : "#ececf0",
+            color: "#6e6e73",
+            fontSize: 10,
+            padding: "1px 6px"
+          }}>{groupsTotal}</span>
+        </button>
+
+        {bancos.map(bt => {
+          const bancoActivo = selectedBanco === bt.banco;
+          const anios = Array.from(bt.anios.values()).sort((a, b) => {
+            if (a.anio === "Sin fecha") return 1;
+            if (b.anio === "Sin fecha") return -1;
+            return b.anio.localeCompare(a.anio);
+          });
+
+          return (
+            <div key={bt.banco} className="mt-1">
+              <button
+                className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between ${bancoActivo && !selectedAnio ? "font-semibold" : ""}`}
+                style={{
+                  background: bancoActivo && !selectedAnio ? "var(--accent-soft)" : "transparent",
+                  color: bancoActivo && !selectedAnio ? "var(--accent)" : "var(--text)"
+                }}
+                onClick={() => onSelectBanco(bt.banco)}
+              >
+                <span className="flex items-center gap-2 text-[13px] truncate">
+                  <Icon.Bank/> <span className="truncate">{bt.banco}</span>
+                </span>
+                <span className="chip" style={{
+                  background: bancoActivo && !selectedAnio ? "#fff" : "#ececf0",
+                  color: "#6e6e73",
+                  fontSize: 10,
+                  padding: "1px 6px"
+                }}>{bt.total}</span>
+              </button>
+
+              {bancoActivo && (
+                <div className="ml-4 mt-1 space-y-0.5">
+                  {anios.map(at => {
+                    const anioActivo = selectedAnio === at.anio;
+                    const meses = Array.from(at.meses.entries())
+                      .sort((a, b) => b[0].localeCompare(a[0]));
+
+                    return (
+                      <div key={at.anio}>
+                        <button
+                          className="w-full text-left px-2.5 py-1.5 rounded-lg flex items-center justify-between text-[12px]"
+                          style={{
+                            background: anioActivo && !selectedMes ? "var(--accent-soft)" : "transparent",
+                            color: anioActivo && !selectedMes ? "var(--accent)" : "var(--text)",
+                            fontWeight: anioActivo && !selectedMes ? 600 : 400
+                          }}
+                          onClick={() => onSelectAnio(bt.banco, at.anio)}
+                        >
+                          <span>{at.anio}</span>
+                          <span className="text-[10px] text-ink-3">{at.total}</span>
+                        </button>
+
+                        {anioActivo && (
+                          <div className="ml-3 mt-0.5 space-y-0.5">
+                            {meses.map(([mesKey, items]) => {
+                              const mesActivo = selectedMes === mesKey;
+                              const label = mesKey === "??" ? "Sin mes" : (MESES_ABREV[Number(mesKey) - 1] ?? mesKey);
+                              return (
+                                <button
+                                  key={mesKey}
+                                  className="w-full text-left px-2.5 py-1 rounded-lg flex items-center justify-between text-[12px]"
+                                  style={{
+                                    background: mesActivo ? "var(--accent-soft)" : "transparent",
+                                    color: mesActivo ? "var(--accent)" : "#3a3a3d",
+                                    fontWeight: mesActivo ? 600 : 400
+                                  }}
+                                  onClick={() => onSelectMes(bt.banco, at.anio, mesKey)}
+                                >
+                                  <span>{label}</span>
+                                  <span className="text-[10px] text-ink-3">{items.length}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {bancos.length === 0 && (
+          <div className="p-6 text-center text-ink-3 text-[12px]">
+            Cuando cargues tu primer extracto, aparecerá acá organizado por banco y período.
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+// ============================================================================
+// Breadcrumb navegable arriba del contenido
+// ============================================================================
+
+function BreadcrumbNav({
+  selectedBanco, selectedAnio, selectedMes,
+  onSelectAll, onSelectBanco, onSelectAnio
+}: {
+  selectedBanco: string | null;
+  selectedAnio: string | null;
+  selectedMes: string | null;
+  onSelectAll: () => void;
+  onSelectBanco: (banco: string) => void;
+  onSelectAnio: (banco: string, anio: string) => void;
+}) {
+  const parts: { label: string; onClick: (() => void) | null }[] = [];
+  parts.push({ label: "Todos los bancos", onClick: onSelectAll });
+  if (selectedBanco) parts.push({ label: selectedBanco, onClick: () => onSelectBanco(selectedBanco) });
+  if (selectedAnio && selectedBanco) parts.push({ label: selectedAnio, onClick: () => onSelectAnio(selectedBanco, selectedAnio) });
+  if (selectedMes && selectedAnio) {
+    const mesLabel = selectedMes === "??" ? "Sin mes" : (MESES_ABREV[Number(selectedMes) - 1] ?? selectedMes);
+    parts.push({ label: mesLabel, onClick: null });
+  }
+
+  return (
+    <div className="flex items-center gap-1 text-[13px] flex-wrap">
+      {parts.map((p, i) => {
+        const isLast = i === parts.length - 1;
+        return (
+          <span key={i} className="flex items-center gap-1">
+            {i > 0 && <span className="text-ink-3 text-[11px]">/</span>}
+            {p.onClick && !isLast ? (
+              <button
+                className="hover:underline"
+                style={{ color: "var(--accent)" }}
+                onClick={p.onClick}
+              >
+                {p.label}
+              </button>
+            ) : (
+              <span className={isLast ? "font-semibold" : ""}
+                    style={{ color: isLast ? "var(--text)" : "#6e6e73" }}>
+                {p.label}
+              </span>
+            )}
+          </span>
+        );
+      })}
     </div>
   );
 }
