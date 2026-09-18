@@ -14,6 +14,7 @@ const items = [
   { href: "/accounting", t: "Contabilidad",  icon: <Icon.File /> },
   { href: "/documents",  t: "Documentación", icon: <Icon.Folder /> },
   { href: "/balances",   t: "Balances",      icon: <Icon.File /> },
+  { href: "/ads",        t: "Meta Ads",      icon: <Icon.Megaphone /> },
   { href: "/settings",   t: "Configuración", icon: <Icon.Cog /> }
 ];
 

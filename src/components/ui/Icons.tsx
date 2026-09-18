@@ -63,4 +63,13 @@ export const Icon = {
   Camera: (p: SVGProps<SVGSVGElement>) => (
     <svg {...base} {...p} width={22} height={22}><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
   ),
+  Megaphone: (p: SVGProps<SVGSVGElement>) => (
+    <svg {...base} {...p}><path d="M3 11v2a1 1 0 0 0 1 1h2l5 4V6L6 10H4a1 1 0 0 0-1 1z"/><path d="M15 9.5a3.5 3.5 0 0 1 0 5"/><path d="M17.5 7a7 7 0 0 1 0 10"/><path d="M6 14v4a1 1 0 0 0 1 1h1"/></svg>
+  ),
+  Trash: (p: SVGProps<SVGSVGElement>) => (
+    <svg {...base} {...p} width={16} height={16}><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+  ),
+  Eye: (p: SVGProps<SVGSVGElement>) => (
+    <svg {...base} {...p} width={16} height={16}><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
+  ),
 };

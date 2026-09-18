@@ -10,3 +10,4 @@ build/
 .vercel
 .supabase/
 next-env.d.ts
+.claude-tmp/

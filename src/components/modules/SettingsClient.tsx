@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Topbar } from "@/components/ui/Topbar";
 import { Badge } from "@/components/ui/Badge";
 import { Icon } from "@/components/ui/Icons";
+import { SecretsCard } from "./SecretsCard";
 import { createClient } from "@/lib/supabase/client";
 import type { Company, Integration, Profile } from "@/lib/supabase/types";
 
@@ -215,6 +216,8 @@ export function SettingsClient({
               </a>
             </div>
           </div>
+
+          {canEdit && <SecretsCard />}
 
           {canEdit && (
             <PartnersCard
